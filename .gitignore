@@ -69,3 +69,5 @@ libsecp256k1.pc
 ### Python
 __pycache__/
 *.py[oc]
+/out
+batch_verify_example
