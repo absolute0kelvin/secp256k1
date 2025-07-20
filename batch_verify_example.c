@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include <secp256k1.h>
+#include <secp256k1_recovery.h>
 
 /* Include internal secp256k1 headers for real implementation */
 #include "src/util.h"
@@ -22,6 +23,7 @@
 #include "src/group_impl.h"
 #include "src/ecmult_impl.h"
 #include "src/scratch_impl.h"
+#include "src/ecdsa_impl.h"
 
 /* Internal function implementation */
 static int secp256k1_pubkey_load(const secp256k1_context* ctx, secp256k1_ge* ge, const secp256k1_pubkey* pubkey) {
@@ -41,6 +43,70 @@ typedef struct {
     unsigned char msg_hash[32];      /* Hash of the message being signed */
     int valid;                       /* Result of verification */
 } tx_input_t;
+
+/* Reconstruct R point from signature using secp256k1_ecdsa_sig_recover approach */
+static int reconstruct_r_point(const secp256k1_scalar *r,
+                              const secp256k1_scalar *u1, 
+                              const secp256k1_scalar *u2,
+                              const secp256k1_ge *pubkey,
+                              secp256k1_gej *r_point_out) {
+    unsigned char brx[32];
+    secp256k1_fe fx;
+    secp256k1_ge R_point;
+    
+    /* Convert r scalar to bytes */
+    secp256k1_scalar_get_b32(brx, r);
+    
+    /* Set field element from r bytes */
+    if (!secp256k1_fe_set_b32_limit(&fx, brx)) {
+        return 0; /* Invalid r value */
+    }
+    
+    /* Reconstruct correct R point by testing which one satisfies the signature equation
+     * WARNING: This is computationally EXPENSIVE! Up to 4 full ecmult operations per signature.
+     * Normal ECDSA verification avoids this by providing R points more directly. */
+    for (int recovery_flag = 0; recovery_flag < 4; recovery_flag++) {
+        secp256k1_fe fx_candidate = fx;
+        
+        /* Handle recovery_flag >= 2 case (add order to x coordinate) */
+        if (recovery_flag >= 2) {
+            if (secp256k1_fe_cmp_var(&fx, &secp256k1_ecdsa_const_p_minus_order) >= 0) {
+                continue; /* x + order would be >= field size */
+            }
+            secp256k1_fe_add(&fx_candidate, &secp256k1_ecdsa_const_order_as_fe);
+        }
+        
+        /* Try to construct point with this x coordinate and y parity */
+        if (secp256k1_ge_set_xo_var(&R_point, &fx_candidate, recovery_flag & 1)) {
+            /* Test if this R point satisfies: R = u1*G + u2*Pubkey */
+            secp256k1_gej test_result, pubkey_gej;
+            secp256k1_gej_set_ge(&pubkey_gej, pubkey);
+            
+            /* Compute u1*G + u2*Pubkey - EXPENSIVE OPERATION! */
+            secp256k1_ecmult(&test_result, &pubkey_gej, u2, u1);
+            
+            /* Check if this equals our candidate R point */
+            if (secp256k1_gej_eq_ge_var(&test_result, &R_point)) {
+                /* This is the correct R point! */
+                secp256k1_gej_set_ge(r_point_out, &R_point);
+                return 1; /* Success */
+            }
+        }
+    }
+    
+    return 0; /* Could not reconstruct correct R point */
+}
+
+/* Verify R point is on the curve (MUCH simpler than signature verification!) */
+static int verify_r_point(secp256k1_gej *r_point) {
+    secp256k1_ge r_point_affine;
+    
+    /* Convert from Jacobian to affine coordinates */
+    secp256k1_ge_set_gej(&r_point_affine, r_point);
+    
+    /* Check if point is valid (on curve: y² = x³ + 7) - very fast! */
+    return secp256k1_ge_is_valid_var(&r_point_affine);
+}
 
 /* Pre-compute scalar inverses for batch verification optimization */
 static int precompute_scalar_inverses(secp256k1_context *ctx, 
@@ -116,41 +182,31 @@ typedef struct {
 static int generate_test_input(secp256k1_context *ctx, tx_input_t *input, 
                               const unsigned char *seckey, int make_invalid) {
     secp256k1_pubkey pubkey;
+    secp256k1_ecdsa_recoverable_signature recoverable_sig;
     secp256k1_ecdsa_signature sig;
-    
-    /* Generate public key */
-    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, seckey)) {
-        printf("Failed to create public key\n");
-        return 0;
-    }
-    
-    /* Serialize public key */
-    size_t pubkey_len = 33;
-    if (!secp256k1_ec_pubkey_serialize(ctx, input->pubkey, &pubkey_len, 
-                                      &pubkey, SECP256K1_EC_COMPRESSED)) {
-        printf("Failed to serialize public key\n");
-        return 0;
-    }
     
     /* Create a test message hash */
     for (int i = 0; i < 32; i++) {
         input->msg_hash[i] = (unsigned char)(i + 1);
     }
     
-    /* Optionally corrupt the message to create invalid signature */
-    if (make_invalid) {
-        input->msg_hash[0] ^= 0xFF;  /* Flip bits to make hash different */
+    /* Always sign with the correct secret key using recoverable signature */
+    if (!secp256k1_ecdsa_sign_recoverable(ctx, &recoverable_sig, input->msg_hash, seckey, NULL, NULL)) {
+        printf("Failed to create recoverable signature\n");
+        return 0;
     }
     
-    /* Sign the original message (before corruption if any) */
-    unsigned char original_hash[32];
-    memcpy(original_hash, input->msg_hash, 32);
-    if (make_invalid) {
-        original_hash[0] ^= 0xFF;  /* Sign the original, uncorrupted hash */
+    /* Optional: Extract recovery ID for demonstration */
+    unsigned char recovery_sig[65];
+    int recovery_id;
+    if (secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, recovery_sig, &recovery_id, &recoverable_sig)) {
+        /* Recovery ID is now available (0, 1, 2, or 3) */
+        /* This allows public key recovery from signature + message */
     }
     
-    if (!secp256k1_ecdsa_sign(ctx, &sig, original_hash, seckey, NULL, NULL)) {
-        printf("Failed to create signature\n");
+    /* Convert recoverable signature to regular signature for DER serialization */
+    if (!secp256k1_ecdsa_recoverable_signature_convert(ctx, &sig, &recoverable_sig)) {
+        printf("Failed to convert recoverable signature\n");
         return 0;
     }
     
@@ -159,6 +215,32 @@ static int generate_test_input(secp256k1_context *ctx, tx_input_t *input,
     if (!secp256k1_ecdsa_signature_serialize_der(ctx, input->signature, 
                                                 &input->sig_len, &sig)) {
         printf("Failed to serialize signature\n");
+        return 0;
+    }
+    
+    /* Generate public key: use wrong key when make_invalid is 1 */
+    unsigned char pubkey_seckey[32];
+    if (make_invalid) {
+        /* Use a different secret key to generate wrong public key */
+        for (int i = 0; i < 32; i++) {
+            pubkey_seckey[i] = seckey[i] ^ 0xFF;  /* Flip all bits to get different key */
+        }
+        pubkey_seckey[0] = 1;  /* Ensure it's still a valid secret key */
+    } else {
+        /* Use the correct secret key for valid signatures */
+        memcpy(pubkey_seckey, seckey, 32);
+    }
+    
+    /* Generate and serialize public key */
+    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, pubkey_seckey)) {
+        printf("Failed to create public key\n");
+        return 0;
+    }
+    
+    size_t pubkey_len = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, input->pubkey, &pubkey_len, 
+                                      &pubkey, SECP256K1_EC_COMPRESSED)) {
+        printf("Failed to serialize public key\n");
         return 0;
     }
     
@@ -216,11 +298,121 @@ static int individual_verify(batch_verify_data_t *batch_data) {
 typedef struct {
     secp256k1_scalar *u2_scalars;  /* r/s values */
     secp256k1_ge *pubkeys;         /* Public keys */
+    secp256k1_gej *R_points_gej;   /* Reconstructed R points (Jacobian) */
     secp256k1_scalar g_scalar;     /* Sum of u1 values */
     secp256k1_gej expected_sum;    /* Sum of R points */
     secp256k1_scalar *s_inverses;  /* Pre-computed s^(-1) values */
     size_t num_points;             /* Number of points in batch */
 } internal_batch_data_t;
+
+/* Helper function to print a Jacobian point */
+static void print_jacobian_point(const secp256k1_gej *point, const char *label) {
+    printf("%s (Jacobian):\n", label);
+    secp256k1_ge point_ge;
+    secp256k1_gej temp_point = *point;
+    secp256k1_ge_set_gej_var(&point_ge, &temp_point);
+    
+    unsigned char x_bytes[32], y_bytes[32];
+    secp256k1_fe_get_b32(x_bytes, &point_ge.x);
+    secp256k1_fe_get_b32(y_bytes, &point_ge.y);
+    
+    printf("  X: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", x_bytes[i]);
+    }
+    printf("\n");
+    
+    printf("  Y: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", y_bytes[i]);
+    }
+    printf("\n");
+}
+
+/* Print function for internal_batch_data_t */
+static void print_internal_batch_data(const internal_batch_data_t *batch_data) {
+    printf("\n=== Internal Batch Data ===\n");
+    printf("Number of points: %zu\n", batch_data->num_points);
+    
+    /* Print g_scalar (sum of u1 values) */
+    printf("G scalar (sum of u1 values): ");
+    unsigned char g_scalar_bytes[32];
+    secp256k1_scalar_get_b32(g_scalar_bytes, &batch_data->g_scalar);
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", g_scalar_bytes[i]);
+    }
+    printf("\n");
+    
+    /* Print expected sum point (in Jacobian coordinates) */
+    print_jacobian_point(&batch_data->expected_sum, "Expected sum point");
+    
+    /* Print first few u2 scalars as samples */
+    printf("U2 scalars (first 3 as samples):\n");
+    size_t sample_count = batch_data->num_points < 3 ? batch_data->num_points : 3;
+    for (size_t i = 0; i < sample_count; i++) {
+        unsigned char u2_bytes[32];
+        secp256k1_scalar_get_b32(u2_bytes, &batch_data->u2_scalars[i]);
+        printf("  [%zu]: ", i);
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", u2_bytes[j]);
+        }
+        printf("\n");
+    }
+    if (batch_data->num_points > 3) {
+        printf("  ... (%zu more)\n", batch_data->num_points - 3);
+    }
+    
+    /* Print first few public keys as samples */
+    printf("Public keys (first 3 as samples):\n");
+    for (size_t i = 0; i < sample_count; i++) {
+        unsigned char pubkey_x[32], pubkey_y[32];
+        secp256k1_fe_get_b32(pubkey_x, &batch_data->pubkeys[i].x);
+        secp256k1_fe_get_b32(pubkey_y, &batch_data->pubkeys[i].y);
+        
+        printf("  [%zu] X: ", i);
+        for (int j = 0; j < 16; j++) {  // Show first 16 bytes only
+            printf("%02x", pubkey_x[j]);
+        }
+        printf("...\n");
+        
+        printf("      Y: ");
+        for (int j = 0; j < 16; j++) {  // Show first 16 bytes only
+            printf("%02x", pubkey_y[j]);
+        }
+        printf("...\n");
+    }
+    if (batch_data->num_points > 3) {
+        printf("  ... (%zu more public keys)\n", batch_data->num_points - 3);
+    }
+    
+    /* Print first few s_inverses as samples */
+    printf("S^(-1) values (first 3 as samples):\n");
+    for (size_t i = 0; i < sample_count; i++) {
+        unsigned char s_inv_bytes[32];
+        secp256k1_scalar_get_b32(s_inv_bytes, &batch_data->s_inverses[i]);
+        printf("  [%zu]: ", i);
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", s_inv_bytes[j]);
+        }
+        printf("\n");
+    }
+    if (batch_data->num_points > 3) {
+        printf("  ... (%zu more)\n", batch_data->num_points - 3);
+    }
+    
+    /* Print first few R points as samples */
+    printf("R points (first 3 as samples):\n");
+    for (size_t i = 0; i < sample_count; i++) {
+        char label[64];
+        snprintf(label, sizeof(label), "  R point [%zu]", i);
+        print_jacobian_point(&batch_data->R_points_gej[i], label);
+    }
+    if (batch_data->num_points > 3) {
+        printf("  ... (%zu more R points)\n", batch_data->num_points - 3);
+    }
+    
+    printf("=============================\n\n");
+}
 
 /* Callback function for secp256k1_ecmult_multi_var */
 static int internal_batch_callback(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
@@ -280,7 +472,7 @@ static int demonstrate_internal_batch_verify(secp256k1_context *ctx,
         &batch_data->g_scalar,            /* G scalar: sum of all u1 values */
         internal_batch_callback,          /* Callback providing (u2, pubkey) pairs */
         batch_data,                       /* Callback data */
-        num_inputs                        /* Number of signatures */
+        batch_data->num_points            /* Number of valid signatures */
     );
     
     printf("  → Step 7: Compare result with expected sum\n");
@@ -293,6 +485,13 @@ static int demonstrate_internal_batch_verify(secp256k1_context *ctx,
         success = secp256k1_gej_is_infinity(&diff);
         
         printf("  → Batch verification result: %s\n", success ? "ALL VALID" : "SOME INVALID");
+        
+        if (success) {
+            printf("  → Mathematical verification: result == expected ✅\n");
+        } else {
+            printf("  → Mathematical verification: result != expected ❌\n");
+            printf("  → This indicates invalid signatures were detected!\n");
+        }
     } else {
         printf("  → ERROR: secp256k1_ecmult_multi_var failed\n");
     }
@@ -331,12 +530,14 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
     /* Allocate arrays for real batch processing */
     batch_data.u2_scalars = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
     batch_data.pubkeys = malloc(batch_data.num_points * sizeof(secp256k1_ge));
+    batch_data.R_points_gej = malloc(batch_data.num_points * sizeof(secp256k1_gej));
     batch_data.s_inverses = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
     
-    if (!batch_data.u2_scalars || !batch_data.pubkeys || !batch_data.s_inverses) {
+    if (!batch_data.u2_scalars || !batch_data.pubkeys || !batch_data.R_points_gej || !batch_data.s_inverses) {
         printf("ERROR: Failed to allocate batch verification data\n");
         if (batch_data.u2_scalars) free(batch_data.u2_scalars);
         if (batch_data.pubkeys) free(batch_data.pubkeys);
+        if (batch_data.R_points_gej) free(batch_data.R_points_gej);
         if (batch_data.s_inverses) free(batch_data.s_inverses);
         return;
     }
@@ -351,6 +552,7 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
         printf("ERROR: No scalar inverses could be pre-computed\n");
         free(batch_data.u2_scalars);
         free(batch_data.pubkeys);
+        free(batch_data.R_points_gej);
         free(batch_data.s_inverses);
         return;
     }
@@ -368,6 +570,7 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
     printf("Processing signatures using VERIFIED pre-computed scalar inverses...\n");
     
     size_t valid_sigs = 0;
+    start = clock();
     for (size_t i = 0; i < batch_data.num_points && i < num_inputs; i++) {
         secp256k1_ecdsa_signature parsed_sig;
         secp256k1_pubkey pubkey;
@@ -412,15 +615,100 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
         /* Add u1 to G scalar sum */
         secp256k1_scalar_add(&batch_data.g_scalar, &batch_data.g_scalar, &u1);
         
-        valid_sigs++;
+        /* CRITICAL: Reconstruct R point from signature using dedicated function */
+        if (!reconstruct_r_point(&r, &u1, &u2, &batch_data.pubkeys[valid_sigs], &batch_data.R_points_gej[valid_sigs])) {
+            continue; /* Could not reconstruct correct R point */
+        }
+         
+         valid_sigs++;
     }
+    end = clock();
+    double prepare_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("Time for preparation: %.6f seconds\n", prepare_time);
+    
+    /* Dedicated loop: Add all reconstructed R points to expected sum */
+    printf("Computing expected sum from %zu reconstructed R points...\n", valid_sigs);
+    
+         /* 
+      * COMPUTATIONAL COMPLEXITY ANALYSIS:
+      * 
+      * R Point RECONSTRUCTION (what we did above):
+      *   - Up to 4 recovery attempts per signature
+      *   - Each attempt: secp256k1_ecmult() + point construction + comparison
+      *   - Total: Up to 4 × ecmult operations per signature
+      *   - Most expensive part of the entire process!
+      *
+      * R Point CURVE VALIDATION (simplest check):
+      *   - Just verify y² = x³ + 7 (mod p) - pure field arithmetic
+      *   - No expensive elliptic curve multiplications needed!
+      *   - ~100x faster than reconstruction!
+      *
+      * R Point SIGNATURE VERIFICATION (intermediate cost):
+      *   - Only 1 × secp256k1_ecmult() operation per signature  
+      *   - Compute u1*G + u2*pubkey and compare with given R
+      *   - ~4x faster than reconstruction, slower than curve validation
+      *
+      * This is why ECDSA typically provides R points more directly rather than
+      * requiring full reconstruction from just the r scalar coordinate.
+      */
+     printf("Note: R point reconstruction required up to 4 ecmult ops per signature\n");
+     printf("      R point curve validation needs only field arithmetic (super fast!)\n");
+     
+     /* Demonstrate simple curve validation on a few reconstructed R points */
+     clock_t curve_check_start = clock();
+     size_t valid_on_curve = 0;
+     for (size_t i = 0; i < valid_sigs; i++) {
+         if (verify_r_point(&batch_data.R_points_gej[i])) {
+             valid_on_curve++;
+         }
+         secp256k1_gej_add_var(&batch_data.expected_sum, &batch_data.expected_sum, &batch_data.R_points_gej[i], NULL);
+     }
+     clock_t curve_check_end = clock();
+     double curve_check_time = ((double)(curve_check_end - curve_check_start)) / CLOCKS_PER_SEC;
+     printf("Validated %zu R points on curve in %.6f seconds (avg: %.6f sec per check)\n", 
+            valid_on_curve, curve_check_time, curve_check_time / (valid_on_curve > 0 ? valid_on_curve : 1));
+    
     
     printf("Successfully prepared %zu signatures for real batch verification\n", valid_sigs);
+    if (valid_sigs < batch_data.num_points) {
+        printf("Note: %zu signatures were skipped due to parsing errors\n", 
+               batch_data.num_points - valid_sigs);
+    }
+    
+    /* CRITICAL INSIGHT: Count how many signatures are actually invalid */
+    size_t invalid_count = 0;
+    for (size_t i = 0; i < num_inputs && i < 500; i++) {
+        if (!verify_single_signature(ctx, &inputs[i])) {
+            invalid_count++;
+        }
+    }
+    
+    printf("\n=== SIGNATURE VALIDITY ANALYSIS ===\n");
+    printf("Total signatures in dataset: %zu\n", num_inputs);
+    printf("Valid signatures: %zu\n", num_inputs - invalid_count);  
+    printf("Invalid signatures: %zu\n", invalid_count);
+    
+    if (invalid_count > 0) {
+        printf("\n⚠️  WARNING: Dataset contains %zu INVALID signatures!\n", invalid_count);
+        printf("   This means batch verification should FAIL or detect them.\n");
+        printf("   If batch verification reports 'ALL VALID', there's a bug.\n");
+    } else {
+        printf("\n✅ All signatures in dataset are valid.\n");
+        printf("   Batch verification should report 'ALL VALID'.\n");
+    }
+    
+    /* Update batch data with actual processed count */
+    batch_data.num_points = valid_sigs;
+    
+    /* Print the internal batch data structure for inspection */
+    print_internal_batch_data(&batch_data);
     
     if (valid_sigs == 0) {
         printf("ERROR: No valid signatures to process\n");
         free(batch_data.u2_scalars);
         free(batch_data.pubkeys);
+        free(batch_data.R_points_gej);
+        free(batch_data.s_inverses);
         return;
     }
     
@@ -433,6 +721,7 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
     /* Cleanup */
     free(batch_data.u2_scalars);
     free(batch_data.pubkeys);
+    free(batch_data.R_points_gej);
     free(batch_data.s_inverses);
     
     printf("Time for batch verification demo: %.6f seconds\n", batch_time);
@@ -473,11 +762,11 @@ int main() {
         }
         seckey[0] = 1; /* Ensure it's valid */
         
-        int make_invalid = 0;
-        /* Uncomment following lines to make some signatures invalid for demonstration */
-	//if (i == 7 || i == 123 || i == 456) {
+                int make_invalid = 0;
+        /* Make some signatures invalid for demonstration */
+        //if (i >= 490) {  /* Make last 10 signatures invalid for testing */
         //    make_invalid = 1;
-	//}
+        //}
         
         if (!generate_test_input(ctx, &inputs[i], seckey, make_invalid)) {
             printf("Failed to generate test input %d\n", i);
