@@ -116,7 +116,7 @@ static int reconstruct_r_point(const secp256k1_scalar *r,
                               const secp256k1_scalar *u1, 
                               const secp256k1_scalar *u2,
                               const secp256k1_ge *pubkey,
-                              secp256k1_gej *r_point_out) {
+                              secp256k1_ge *r_point_out) {
     unsigned char brx[32];
     secp256k1_fe fx;
     secp256k1_ge R_point;
@@ -154,8 +154,8 @@ static int reconstruct_r_point(const secp256k1_scalar *r,
             
             /* Check if this equals our candidate R point */
             if (secp256k1_gej_eq_ge_var(&test_result, &R_point)) {
-                /* This is the correct R point! */
-                secp256k1_gej_set_ge(r_point_out, &R_point);
+                /* This is the correct R point! Return it in affine coordinates */
+                *r_point_out = R_point;
                 return 1; /* Success */
             }
         }
@@ -175,22 +175,20 @@ static int verify_r_point(secp256k1_gej *r_point) {
     return secp256k1_ge_is_valid_var(&r_point_affine);
 }
 
-/* Pre-compute scalar inverses for batch verification optimization */
-static int precompute_scalar_inverses(secp256k1_context *ctx, 
+/* Parse signatures and extract s values for optimized batch verification */
+static int parse_signatures_for_batch(secp256k1_context *ctx, 
                                      tx_input_t *inputs, 
                                      size_t num_inputs,
-                                     secp256k1_scalar *s_inverses,
+                                     secp256k1_scalar *s_values,
                                      size_t max_batch_size) {
     clock_t start = clock();
     size_t processed = 0;
-    size_t verified_inverses = 0;
     size_t batch_size = (num_inputs > max_batch_size) ? max_batch_size : num_inputs;
     
-    printf("Pre-computing and verifying scalar inverses for %zu signatures...\n", batch_size);
+    printf("Parsing signatures and extracting s values for %zu signatures...\n", batch_size);
     
     for (size_t i = 0; i < batch_size && i < num_inputs; i++) {
         secp256k1_ecdsa_signature parsed_sig;
-        secp256k1_scalar s;
         unsigned char sig_compact[64];
         int overflow;
         
@@ -203,36 +201,17 @@ static int precompute_scalar_inverses(secp256k1_context *ctx,
         }
         
         /* Extract s scalar from signature */
-        secp256k1_scalar_set_b32(&s, sig_compact + 32, &overflow);
+        secp256k1_scalar_set_b32(&s_values[processed], sig_compact + 32, &overflow);
         if (overflow) continue;
         
-        /* Compute s^(-1) - this is the expensive operation we're pre-computing */
-        secp256k1_scalar_inverse_var(&s_inverses[processed], &s);
-        
-        /* VERIFICATION: Check that s * s^(-1) ≡ 1 (mod n) */
-        secp256k1_scalar verification_result;
-        secp256k1_scalar_mul(&verification_result, &s, &s_inverses[processed]);
-        
-        /* Check if result equals 1 (multiplicative identity) */
-        if (!secp256k1_scalar_is_one(&verification_result)) {
-            printf("ERROR: Scalar inverse verification failed for signature %zu!\n", i);
-            printf("       s * s^(-1) != 1, skipping this signature\n");
-            continue; /* Skip this invalid inverse */
-        }
-        
-        verified_inverses++; /* Count successful verification */
         processed++;
     }
     
     clock_t end = clock();
-    double precompute_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    double parse_time = ((double)(end - start)) / CLOCKS_PER_SEC;
     
-    printf("Pre-computed %zu scalar inverses in %.6f seconds\n", processed, precompute_time);
-    printf("Verified %zu inverses: s * s^(-1) ≡ 1 (mod n) ✓\n", verified_inverses);
-    if (verified_inverses != processed) {
-        printf("WARNING: %zu inverses failed verification!\n", processed - verified_inverses);
-    }
-    printf("Average time per inverse (including verification): %.6f seconds\n", precompute_time / processed);
+    printf("Parsed %zu signatures in %.6f seconds\n", processed, parse_time);
+    printf("Average time per signature parse: %.6f seconds\n", parse_time / processed);
     
     return processed;
 }
@@ -363,12 +342,12 @@ static int individual_verify(batch_verify_data_t *batch_data) {
 
 /* Real batch verification implementation with internal API access */
 typedef struct {
-    secp256k1_scalar *u2_scalars;  /* r/s values */
+    secp256k1_scalar *u2_scalars;  /* r values (not r/s) */
     secp256k1_ge *pubkeys;         /* Public keys */
-    secp256k1_gej *R_points_gej;   /* Reconstructed R points (Jacobian) */
-    secp256k1_scalar g_scalar;     /* Sum of u1 values */
+    secp256k1_ge *R_points_ge;     /* Reconstructed R points (Affine) */
+    secp256k1_scalar g_scalar;     /* Sum of u1 values (not u1/s) */
     secp256k1_gej expected_sum;    /* Which will be 0 */
-    secp256k1_scalar *s_inverses;  /* Pre-computed s^(-1) values */
+    secp256k1_scalar *s_values;    /* s values from signatures */
     secp256k1_scalar *coeff_vector; /* Random coefficients for random linear combination */
     size_t num_points;             /* Number of points in batch */
 } internal_batch_data_t;
@@ -453,14 +432,14 @@ static void print_internal_batch_data(const internal_batch_data_t *batch_data) {
         printf("  ... (%zu more public keys)\n", batch_data->num_points - 3);
     }
     
-    /* Print first few s_inverses as samples */
-    printf("S^(-1) values (first 3 as samples):\n");
+    /* Print first few s values as samples */
+    printf("S values (first 3 as samples):\n");
     for (size_t i = 0; i < sample_count; i++) {
-        unsigned char s_inv_bytes[32];
-        secp256k1_scalar_get_b32(s_inv_bytes, &batch_data->s_inverses[i]);
+        unsigned char s_bytes[32];
+        secp256k1_scalar_get_b32(s_bytes, &batch_data->s_values[i]);
         printf("  [%zu]: ", i);
         for (int j = 0; j < 32; j++) {
-            printf("%02x", s_inv_bytes[j]);
+            printf("%02x", s_bytes[j]);
         }
         printf("\n");
     }
@@ -471,9 +450,21 @@ static void print_internal_batch_data(const internal_batch_data_t *batch_data) {
     /* Print first few R points as samples */
     printf("R points (first 3 as samples):\n");
     for (size_t i = 0; i < sample_count; i++) {
-        char label[64];
-        snprintf(label, sizeof(label), "  R point [%zu]", i);
-        print_jacobian_point(&batch_data->R_points_gej[i], label);
+        unsigned char x_bytes[32], y_bytes[32];
+        secp256k1_fe_get_b32(x_bytes, &batch_data->R_points_ge[i].x);
+        secp256k1_fe_get_b32(y_bytes, &batch_data->R_points_ge[i].y);
+        
+        printf("  R point [%zu] (Affine):\n", i);
+        printf("    X: ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", x_bytes[j]);
+        }
+        printf("\n");
+        printf("    Y: ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", y_bytes[j]);
+        }
+        printf("\n");
     }
     if (batch_data->num_points > 3) {
         printf("  ... (%zu more R points)\n", batch_data->num_points - 3);
@@ -486,32 +477,31 @@ static void print_internal_batch_data(const internal_batch_data_t *batch_data) {
 /* Optimized callback structure for single secp256k1_ecmult_multi_var call */
 typedef struct {
     secp256k1_scalar *coeff_vector;    /* Random coefficients */
-    secp256k1_gej *R_points_gej;       /* R points (first num_points indices) */
+    secp256k1_ge *R_points_ge;         /* R points in affine coordinates */
+    secp256k1_scalar *s_values;        /* s values for R points */
     secp256k1_scalar *u2_scalars;      /* u2 scalars for pubkeys */
     secp256k1_ge *pubkeys;             /* Public keys (next num_points indices) */
     size_t num_points;                 /* Number of signatures */
 } optimized_batch_data_t;
 
 /* Optimized callback for single verification equation: 
- * sum(coeff[i] * R[i]) - sum(coeff[i] * u1[i]) * G - sum(coeff[i] * u2[i] * pubkey[i]) = 0
- * Indices 0 to num_points-1: R points with +coeff[i]
- * Indices num_points to 2*num_points-1: pubkeys with -coeff[i]*u2[i]
+ * sum(coeff[i] * u1[i]) * G + sum(coeff[i] * u2[i] * pubkey[i]) - sum(coeff[i] * s[i] * R[i]) = 0
+ * Indices 0 to num_points-1: pubkeys with +coeff[i]*u2[i]
+ * Indices num_points to 2*num_points-1: R points with -coeff[i]*s[i]
  */
 static int optimized_batch_callback(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
     optimized_batch_data_t *batch = (optimized_batch_data_t *)data;
     
     if (idx < batch->num_points) {
-        /* First half: R points with positive coefficients */
-        secp256k1_gej temp_gej = batch->R_points_gej[idx];
-        secp256k1_ge_set_gej_var(pt, &temp_gej); // Convert Jacobian to Affine
-        *sc = batch->coeff_vector[idx];
+        /* First half: pubkeys with positive weighted u2 scalars */
+        *pt = batch->pubkeys[idx];
+        *sc = batch->u2_scalars[idx];  /* Already contains coeff[i] * u2[i] */
     } else {
-        /* Second half: pubkeys with negative weighted u2 scalars */
-        size_t pubkey_idx = idx - batch->num_points;
-        *pt = batch->pubkeys[pubkey_idx];
-        
-        /* u2_scalars already contain coeff[i] * u2[i], so just negate */
-        secp256k1_scalar_negate(sc, &batch->u2_scalars[pubkey_idx]);
+        /* Second half: R points with negative coefficients * s values */
+        size_t r_idx = idx - batch->num_points;
+        *pt = batch->R_points_ge[r_idx];  /* R points are already in affine coordinates */
+        secp256k1_scalar_mul(sc, &batch->coeff_vector[r_idx], &batch->s_values[r_idx]);
+        secp256k1_scalar_negate(sc, sc);  /* Make it negative */
     }
     return 1;
 }
@@ -527,7 +517,7 @@ static int optimized_batch_callback(secp256k1_scalar *sc, secp256k1_ge *pt, size
      *    - Compute u2_i = r_i / s_i
      * 
      * 2. Use secp256k1_ecmult_multi_var to compute:
-     *    result = Σ(R_i) - (Σu1_i) * G - Σ(u2_i * pubkey_i)
+     *    result = sum(coeff[i] * u1[i]) * G + sum(coeff[i] * u2[i] * pubkey[i]) - sum(coeff[i] * s[i] * R[i])
      * 
      * 3. Check if result == 0
      * 
@@ -544,7 +534,7 @@ static int demonstrate_internal_batch_verify(secp256k1_context *ctx,
     printf("  → Step 2: Compute u1 = hash/s and u2 = r/s for each signature\n");
     printf("  → Step 3: Prepare optimized verification equation\n");
     printf("  → Step 4: Single secp256k1_ecmult_multi_var call:\n");
-    printf("            Σ(coeff[i]*R[i]) - Σ(coeff[i]*u1[i])*G - Σ(coeff[i]*u2[i]*pubkey[i]) = 0\n");
+    printf("            Σ(coeff[i]*u1[i])*G + Σ(coeff[i]*u2[i]*pubkey[i]) - Σ(coeff[i]*s[i]*R[i]) = 0\n");
     
     /* Create scratch space for computation */
     scratch = secp256k1_scratch_create(&default_error_callback, 200000); // Larger scratch for more points
@@ -558,24 +548,22 @@ static int demonstrate_internal_batch_verify(secp256k1_context *ctx,
     /* Prepare optimized batch data structure */
     optimized_batch_data_t opt_data;
     opt_data.coeff_vector = batch_data->coeff_vector;
-    opt_data.R_points_gej = batch_data->R_points_gej;
+    opt_data.R_points_ge = batch_data->R_points_ge;
+    opt_data.s_values = batch_data->s_values;
     opt_data.u2_scalars = batch_data->u2_scalars;
     opt_data.pubkeys = batch_data->pubkeys;
     opt_data.num_points = batch_data->num_points;
     
-    /* Negate the g_scalar for the optimized equation */
-    secp256k1_scalar neg_g_scalar;
-    secp256k1_scalar_negate(&neg_g_scalar, &batch_data->g_scalar);
-    
+    /* Use the g_scalar directly for the optimized equation */
     /* The optimized implementation with single secp256k1_ecmult_multi_var call! */
     success = secp256k1_ecmult_multi_var(
         &default_error_callback,          /* Error callback */
         scratch,                          /* Scratch space for computation */
         &result,                          /* Output: should be point at infinity if valid */
-        &neg_g_scalar,                    /* G scalar: negative sum of all weighted u1 values */
-        optimized_batch_callback,         /* Callback providing R points and pubkeys */
+        &batch_data->g_scalar,            /* G scalar: sum of all weighted u1 values */
+        optimized_batch_callback,         /* Callback providing pubkeys and R points */
         &opt_data,                        /* Callback data */
-        2 * batch_data->num_points        /* Total points: R points + pubkeys */
+        2 * batch_data->num_points        /* Total points: pubkeys + R points */
     );
     
     printf("  → Step 6: Check if result equals point at infinity\n");
@@ -588,7 +576,7 @@ static int demonstrate_internal_batch_verify(secp256k1_context *ctx,
         
         if (success) {
             printf("  → Mathematical verification: result == point_at_infinity ✅\n");
-            printf("  → Optimized equation verified: Σ(coeff[i]*R[i]) - Σ(coeff[i]*u1[i])*G - Σ(coeff[i]*u2[i]*pubkey[i]) = 0\n");
+            printf("  → Optimized equation verified: Σ(coeff[i]*u1[i])*G + Σ(coeff[i]*u2[i]*pubkey[i]) - Σ(coeff[i]*s[i]*R[i]) = 0\n");
         } else {
             printf("  → Mathematical verification: result != point_at_infinity ❌\n");
             printf("  → This indicates invalid signatures were detected!\n");
@@ -629,40 +617,44 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
     /* Allocate arrays for real batch processing */
     batch_data.u2_scalars = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
     batch_data.pubkeys = malloc(batch_data.num_points * sizeof(secp256k1_ge));
-    batch_data.R_points_gej = malloc(batch_data.num_points * sizeof(secp256k1_gej));
-    batch_data.s_inverses = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
+    batch_data.R_points_ge = malloc(batch_data.num_points * sizeof(secp256k1_ge));
+    batch_data.s_values = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
     batch_data.coeff_vector = malloc(batch_data.num_points * sizeof(secp256k1_scalar));
     
-    if (!batch_data.u2_scalars || !batch_data.pubkeys || !batch_data.R_points_gej || !batch_data.s_inverses || !batch_data.coeff_vector) {
+    if (!batch_data.u2_scalars || !batch_data.pubkeys || !batch_data.R_points_ge || !batch_data.s_values || !batch_data.coeff_vector) {
         printf("ERROR: Failed to allocate batch verification data\n");
         if (batch_data.u2_scalars) free(batch_data.u2_scalars);
         if (batch_data.pubkeys) free(batch_data.pubkeys);
-        if (batch_data.R_points_gej) free(batch_data.R_points_gej);
-        if (batch_data.s_inverses) free(batch_data.s_inverses);
+        if (batch_data.R_points_ge) free(batch_data.R_points_ge);
+        if (batch_data.s_values) free(batch_data.s_values);
         if (batch_data.coeff_vector) free(batch_data.coeff_vector);
         return;
     }
     
-    /* Pre-compute expensive scalar inverses */
+    /* Parse signatures and extract s values */
     printf("\n=== Pre-computation Phase ===\n");
-    int precomputed_count = precompute_scalar_inverses(ctx, inputs, num_inputs, 
-                                                      batch_data.s_inverses, 
-                                                      batch_data.num_points);
+    int parsed_count = parse_signatures_for_batch(ctx, inputs, num_inputs, 
+                                                 batch_data.s_values, 
+                                                 batch_data.num_points);
     
-    if (precomputed_count == 0) {
-        printf("ERROR: No scalar inverses could be pre-computed\n");
+    if (parsed_count == 0) {
+        printf("ERROR: No signatures could be parsed\n");
         free(batch_data.u2_scalars);
         free(batch_data.pubkeys);
-        free(batch_data.R_points_gej);
-        free(batch_data.s_inverses);
+        free(batch_data.R_points_ge);
+        free(batch_data.s_values);
         free(batch_data.coeff_vector);
         return;
     }
     
-    batch_data.num_points = precomputed_count; /* Update to actual processed count */
+    batch_data.num_points = parsed_count; /* Update to actual processed count */
     
-    /* Allocate and generate random coefficient vector */
+    /* Time the random coefficient generation */
+    clock_t coeff_start = clock();
     generate_random_coefficient_vector(batch_data.coeff_vector, inputs, num_inputs, batch_data.num_points);
+    clock_t coeff_end = clock();
+    double coeff_time = ((double)(coeff_end - coeff_start)) / CLOCKS_PER_SEC;
+    printf("Random coefficient generation time: %.6f seconds\n", coeff_time);
     
     /* Initialize G scalar sum and expected sum */
     secp256k1_scalar_clear(&batch_data.g_scalar);
@@ -672,14 +664,14 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
     
     /* Process signatures using pre-computed inverses */
     printf("\n=== Fast Batch Processing Phase ===\n");
-    printf("Processing signatures using VERIFIED pre-computed scalar inverses...\n");
+    printf("Processing signatures using extracted s values...\n");
     
     size_t valid_sigs = 0;
     start = clock();
     for (size_t i = 0; i < batch_data.num_points && i < num_inputs; i++) {
         secp256k1_ecdsa_signature parsed_sig;
         secp256k1_pubkey pubkey;
-        secp256k1_scalar r, s, u1, u2, msg_scalar;
+        secp256k1_scalar r, u1, u2, msg_scalar;
         unsigned char sig_compact[64];
         int overflow;
         
@@ -699,20 +691,17 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
             continue;
         }
         
-        /* Extract r and s scalars */
+        /* Extract r scalar (s is already extracted in pre-computation) */
         secp256k1_scalar_set_b32(&r, sig_compact, &overflow);
-        if (overflow) continue;
-        secp256k1_scalar_set_b32(&s, sig_compact + 32, &overflow);
         if (overflow) continue;
         
         /* Convert message hash to scalar */
         secp256k1_scalar_set_b32(&msg_scalar, inputs[i].msg_hash, &overflow);
         if (overflow) continue;
         
-        /* Use pre-computed s^(-1) - MUCH FASTER! */
-        secp256k1_scalar *s_inv = &batch_data.s_inverses[valid_sigs];
-        secp256k1_scalar_mul(&u1, &msg_scalar, s_inv);  /* u1 = hash * s^(-1) */
-        secp256k1_scalar_mul(&u2, &r, s_inv);           /* u2 = r * s^(-1) */
+        /* Use u1 = hash and u2 = r directly (no inverses needed!) */
+        u1 = msg_scalar;  /* u1 = hash */
+        u2 = r;           /* u2 = r */
         
         /* Apply random coefficient weighting: coeff[i] * u1 and coeff[i] * u2 */
         secp256k1_scalar weighted_u1, weighted_u2;
@@ -726,7 +715,13 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
         secp256k1_scalar_add(&batch_data.g_scalar, &batch_data.g_scalar, &weighted_u1);
         
         /* CRITICAL: Reconstruct R point from signature using dedicated function */
-        if (!reconstruct_r_point(&r, &u1, &u2, &batch_data.pubkeys[valid_sigs], &batch_data.R_points_gej[valid_sigs])) {
+        /* Note: We pass u1 and u2 directly, but the function expects u1/s and u2/s */
+        secp256k1_scalar s_inv, u1_div_s, u2_div_s;
+        secp256k1_scalar_inverse_var(&s_inv, &batch_data.s_values[valid_sigs]);
+        secp256k1_scalar_mul(&u1_div_s, &u1, &s_inv);  /* u1_div_s = u1 / s */
+        secp256k1_scalar_mul(&u2_div_s, &u2, &s_inv);  /* u2_div_s = u2 / s */
+        
+        if (!reconstruct_r_point(&r, &u1_div_s, &u2_div_s, &batch_data.pubkeys[valid_sigs], &batch_data.R_points_ge[valid_sigs])) {
             continue; /* Could not reconstruct correct R point */
         }
          
@@ -775,8 +770,8 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
         printf("ERROR: No valid signatures to process\n");
         free(batch_data.u2_scalars);
         free(batch_data.pubkeys);
-        free(batch_data.R_points_gej);
-        free(batch_data.s_inverses);
+        free(batch_data.R_points_ge);
+        free(batch_data.s_values);
         free(batch_data.coeff_vector);
         return;
     }
@@ -789,21 +784,26 @@ static void demonstrate_performance_benefit(secp256k1_context *ctx,
 
     double batch_time = ((double)(end - start)) / CLOCKS_PER_SEC;
     
+    /* Include coefficient generation time in total batch time */
+    double total_batch_time = batch_time + coeff_time;
+    
     
     /* Cleanup */
     free(batch_data.u2_scalars);
     free(batch_data.pubkeys);
-    free(batch_data.R_points_gej);
-    free(batch_data.s_inverses);
+    free(batch_data.R_points_ge);
+    free(batch_data.s_values);
     free(batch_data.coeff_vector);
     
     printf("Time for batch verification demo: %.6f seconds\n", batch_time);
+    printf("Total batch time (including coefficient generation): %.6f seconds\n", total_batch_time);
     
     /* Compare with estimated individual time for same subset */
     double individual_subset_time = (individual_time / num_inputs) * batch_data.num_points;
     printf("Individual verification time for %zu signatures: %.6f seconds\n", 
            batch_data.num_points, individual_subset_time);
-    printf("Speed-up: %.6f\n", individual_subset_time / batch_time);
+    printf("Speed-up (batch verification only): %.6f\n", individual_subset_time / batch_time);
+    printf("Speed-up (total batch time): %.6f\n", individual_subset_time / total_batch_time);
 }
 
 
