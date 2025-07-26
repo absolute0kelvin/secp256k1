@@ -918,38 +918,9 @@ int verify_one_by_one(const test_data_t *test_data, const recover_data_t *recove
         return 0;
     }
     
-    /* Allocate array for r values (x-coordinates of R points as scalars) */
-    secp256k1_scalar *r_values = malloc(recover_data->num_entries * sizeof(secp256k1_scalar));
-    if (!r_values) {
-        printf("verify_one_by_one: Failed to allocate memory for r values\n");
-        secp256k1_scratch_destroy(secp256k1_default_error_callback_fn, scratch);
-        secp256k1_context_destroy(ctx);
-        return 0;
-    }
-    
-    /* Extract r values from R points */
-    for (size_t i = 0; i < recover_data->num_entries; i++) {
-        secp256k1_fe r_fe = recover_data->r_points[i].x;
-        unsigned char r_bytes[32];
-        secp256k1_fe_get_b32(r_bytes, &r_fe);
-        int overflow;
-        secp256k1_scalar_set_b32(&r_values[i], r_bytes, &overflow);
-        if (overflow) {
-            printf("verify_one_by_one: r value overflow at index %zu\n", i);
-            /* Clear already-initialized scalars before freeing */
-            for (size_t j = 0; j < i; j++) {
-                secp256k1_scalar_clear(&r_values[j]);
-            }
-            free(r_values);
-            secp256k1_scratch_destroy(secp256k1_default_error_callback_fn, scratch);
-            secp256k1_context_destroy(ctx);
-            return 0;
-        }
-    }
-    
-    /* Set up callback data */
+    /* Set up callback data - use pre-computed r_values from recover_data */
     ecmult_multi_data cb_data = {
-        .r_values = r_values,
+        .r_values = recover_data->r_values,
         .s_values = recover_data->s_values,
         .q_points = recover_data->recovered_pubkeys,
         .r_points = recover_data->r_points,
@@ -989,12 +960,6 @@ int verify_one_by_one(const test_data_t *test_data, const recover_data_t *recove
             printf("Verified %zu/%zu signatures\n", i + 1, recover_data->num_entries);
         }
     }
-    
-    /* Clean up r values (clear for security) */
-    for (size_t i = 0; i < recover_data->num_entries; i++) {
-        secp256k1_scalar_clear(&r_values[i]);
-    }
-    free(r_values);
     
     secp256k1_scratch_destroy(secp256k1_default_error_callback_fn, scratch);
     secp256k1_context_destroy(ctx);
@@ -1123,7 +1088,9 @@ int verify_in_batch(const recover_data_t *recover_data, const secp256k1_scalar *
     secp256k1_scalar combined_z;
     secp256k1_scalar_set_int(&combined_z, 0); /* Initialize to zero */
     
-    secp256k1_scalar current_a = seed_scalar; /* Start with seed for a_0 */
+    /* Start with seed * multiplier for a_0 */
+    secp256k1_scalar current_a = seed_scalar;
+    secp256k1_scalar_mul(&current_a, &current_a, multiplier);
     
     for (size_t i = 0; i < recover_data->num_entries; i++) {
         /* Compute combined scalars: z_i * a_i, r_i * a_i, (-s_i) * a_i */
