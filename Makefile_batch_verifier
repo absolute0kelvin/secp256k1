@@ -1,0 +1,69 @@
+# Makefile for batch_verifier.c
+#
+# Usage:
+#   make -f Makefile_batch_verifier        # Build the program
+#   make -f Makefile_batch_verifier test    # Build and run with default parameters
+#   make -f Makefile_batch_verifier clean   # Clean build files
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -std=c99
+INCLUDES = -I./include -I./src
+LIBS = -lsecp256k1
+
+# Try to find secp256k1 library in common locations
+LIBDIRS = -L. -L./src -L/usr/local/lib -L/opt/homebrew/lib
+
+TARGET = batch_verifier
+SOURCE = batch_verifier.c
+
+.PHONY: all test clean help
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	@echo "Compiling $(SOURCE)..."
+	$(CC) $(CFLAGS) $(INCLUDES) $(LIBDIRS) -o $(TARGET) $(SOURCE) $(LIBS)
+	@echo "Build complete: $(TARGET)"
+
+# Alternative build using static linking if dynamic linking fails
+static: $(SOURCE)
+	@echo "Attempting static build..."
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET) $(SOURCE) -static -lsecp256k1
+	@echo "Static build complete: $(TARGET)"
+
+# Build with local secp256k1 source (if available)
+local: $(SOURCE)
+	@echo "Building with local secp256k1..."
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET) $(SOURCE) \
+		src/secp256k1.c \
+		-DSECP256K1_BUILD -DENABLE_MODULE_RECOVERY \
+		-DENABLE_MODULE_EXTRAKEYS -DENABLE_MODULE_SCHNORRSIG
+	@echo "Local build complete: $(TARGET)"
+
+test: $(TARGET)
+	@echo "Running $(TARGET) with 1000 test entries..."
+	./$(TARGET) 1000
+
+test_large: $(TARGET)
+	@echo "Running $(TARGET) with 10000 test entries..."
+	./$(TARGET) 10000
+
+clean:
+	@echo "Cleaning build files..."
+	rm -f $(TARGET)
+	@echo "Clean complete"
+
+help:
+	@echo "Available targets:"
+	@echo "  all       - Build the program (default)"
+	@echo "  static    - Build with static linking"
+	@echo "  local     - Build with local secp256k1 source"
+	@echo "  test      - Build and run with 100 entries"
+	@echo "  test_large- Build and run with 10000 entries"
+	@echo "  clean     - Remove build files"
+	@echo "  help      - Show this help message"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  make -f Makefile_batch_verifier"
+	@echo "  make -f Makefile_batch_verifier test"
+	@echo "  ./$(TARGET) 5000    # Run with 5000 entries" 
