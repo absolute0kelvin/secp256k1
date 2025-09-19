@@ -166,6 +166,7 @@ typedef struct {
     secp256k1_scalar *z_values;            /* Array of message hashes as scalars */
     secp256k1_ge *r_points;                /* Array of recovered R points */
     secp256k1_scalar *r_values;            /* Array of signature 'r' x-coordinates as scalars */
+    unsigned char *recovery_flags;          /* Array of recovery flags (0: even y, 1: odd y) */
 } recover_data_t;
 
 /**
@@ -324,13 +325,15 @@ static recover_data_t* allocate_recover_data(size_t num) {
     data->z_values = malloc(num * sizeof(secp256k1_scalar));
     data->r_points = malloc(num * sizeof(secp256k1_ge));
     data->r_values = malloc(num * sizeof(secp256k1_scalar));
+    data->recovery_flags = malloc(num * sizeof(unsigned char));
     
-    if (!data->recovered_pubkeys || !data->s_values || !data->z_values || !data->r_points || !data->r_values) {
+    if (!data->recovered_pubkeys || !data->s_values || !data->z_values || !data->r_points || !data->r_values || !data->recovery_flags) {
         free(data->recovered_pubkeys);
         free(data->s_values);
         free(data->z_values);
         free(data->r_points);
         free(data->r_values);
+        free(data->recovery_flags);
         free(data);
         return NULL;
     }
@@ -380,6 +383,7 @@ static void free_recover_data(recover_data_t *data) {
     free(data->z_values);
     free(data->r_points);
     free(data->r_values);
+    free(data->recovery_flags);
     free(data);
 }
 
@@ -732,6 +736,22 @@ int sanity_check(const recover_data_t *data) {
             break;
         }
         
+        /* Bind r to R: require r == x(R) mod n */
+        {
+            secp256k1_fe x_fe = data->r_points[i].x;
+            unsigned char x_bytes[32];
+            secp256k1_scalar r_from_R;
+            int overflow_r_from_R;
+            secp256k1_fe_normalize_var(&x_fe);
+            secp256k1_fe_get_b32(x_bytes, &x_fe);
+            secp256k1_scalar_set_b32(&r_from_R, x_bytes, &overflow_r_from_R);
+            if (!secp256k1_scalar_eq(&r_from_R, &data->r_values[i])) {
+                printf("sanity_check: r does not match x(R) mod n at index %zu\n", i);
+                all_valid = 0;
+                break;
+            }
+        }
+
         /* Check 2: Validate Q points (pubkeys) are valid curve points */
         if (!secp256k1_ge_is_valid_var(&data->recovered_pubkeys[i])) {
             printf("sanity_check: Invalid Q point (pubkey) at index %zu (not on curve)\n", i);
@@ -743,6 +763,11 @@ int sanity_check(const recover_data_t *data) {
             printf("sanity_check: Q point is infinity at index %zu\n", i);
             all_valid = 0;
             break;
+        }
+
+        /* Fill recovery_flags[i] according to parity of recovered_pubkeys[i].y */
+        if (data->recovery_flags) {
+            data->recovery_flags[i] = (unsigned char)(secp256k1_fe_is_odd(&data->recovered_pubkeys[i].y) ? 1 : 0);
         }
         
         /* Check 3: Validate z values (0 <= z < n) */
@@ -977,21 +1002,27 @@ int verify_one_by_one(const test_data_t *test_data, const recover_data_t *recove
 /**
  * verify_in_batch - Batch verify signatures using random linear combination
  * 
- * This function verifies multiple ECDSA signatures simultaneously using the formula:
- * (Σ z_i * a_i) * G + Σ (r_i * a_i * Q_i) + Σ ((-s_i) * a_i * R_i) = 0
+ * Usage model:
+ * - Inputs r_i, s_i, z_i, Q_i, R_i are provided by an untrusted party.
+ * - We compute v_i (recovery id) from R_i as v_i := parity(R_i.y) (0 for even, 1 for odd).
+ * - We then batch-check consistency: (Σ z_i·a_i)·G + Σ (r_i·a_i)·Q_i + Σ ((-s_i)·a_i)·R_i = 0.
+ *   If this holds, with overwhelming probability each tuple satisfies z_i·G + r_i·Q_i - s_i·R_i = 0.
+ * - Later, when an ecrecover computation is requested, we match its (r, s, v, z)
+ *   against the precomputed set and return the corresponding Q if found.
  * 
- * Where:
- * - z_i: message hash as scalar for signature i
- * - a_i: random coefficient for signature i
- * - G: secp256k1 generator point
- * - r_i: x-coordinate of R point as scalar for signature i
- * - Q_i: public key point for signature i
- * - s_i: signature s component as scalar for signature i
- * - R_i: signature R point for signature i
+ * This function implements the batch equation:
+ *   (Σ z_i * a_i) * G + Σ (r_i * a_i * Q_i) + Σ ((-s_i) * a_i * R_i) = 0
+ * where a_i are per-entry random coefficients derived from `multiplier`.
  * 
- * The random coefficients prevent forgery attacks that could fool naive batch verification.
+ * Security notes:
+ * - `sanity_check` is called first to enforce on-curve constraints, low-s, r != 0,
+ *   and the binding r_i == x(R_i) mod n. The batch equation then ensures global
+ *   consistency of Q and R with r, s, z.
+ * - For secp256k1, the recovery id has only parity (bit 0); the overflow bit (bit 1)
+ *   is always 0 for valid signatures produced by the library. If you need Ethereum-style
+ *   v in {27,28}, map as v_eth = 27 + v_i.
  * 
- * @param recover_data Recovered cryptographic components to verify
+ * @param recover_data Recovered cryptographic components to verify (and to store v_i)
  * @param multiplier Random scalar multiplier for generating random coefficients a_i
  * @return 1 if batch verification succeeds, 0 if it fails
  */
@@ -1078,6 +1109,13 @@ int verify_in_batch(const recover_data_t *recover_data, const secp256k1_scalar *
         return 0;
     }
     
+    /* Compute v_i (recovery id parity) from R_i.y and store in recovery_flags if available */
+    if (((recover_data_t*)recover_data)->recovery_flags) {
+        for (size_t i = 0; i < recover_data->num_entries; i++) {
+            ((recover_data_t*)recover_data)->recovery_flags[i] = (unsigned char)(secp256k1_fe_is_odd(&recover_data->r_points[i].y) ? 1 : 0);
+        }
+    }
+
     /* Generate pseudo-random coefficients a_i using simple LCG */
     unsigned char seed[32] = {0x42}; /* Simple deterministic seed */
     secp256k1_scalar seed_scalar;
