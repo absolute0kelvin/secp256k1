@@ -28,6 +28,27 @@ typedef struct {
     unsigned char v;           /* 0 even, 1 odd */
 } secp256k1_batch_entry;
 
+/* Zero-copy batch verify from RDAT v1 buffer. Validates header and size, then
+ * treats the per-entry region as an array of secp256k1_batch_entry without copying.
+ */
+SECP256K1_API int secp256k1_verify_in_batch_rdat(
+    const secp256k1_context* ctx,
+    const unsigned char* in,
+    size_t in_size,
+    const unsigned char multiplier32[32]
+);
+
+/* Parse RDAT v1 and return a zero-copy view of entries. Validates magic,
+ * version, and size. Returns 1 on success and sets outputs, 0 on failure.
+ * Note: This function does not require a context.
+ */
+SECP256K1_API int secp256k1_rdat_view_parse(
+    const unsigned char* in,
+    size_t in_len,
+    const secp256k1_batch_entry** entries_view_out,
+    size_t* n_out
+);
+
 /* Batch verify: returns 1 if all entries pass, 0 otherwise. */
 SECP256K1_API int secp256k1_verify_in_batch(
     const secp256k1_context* ctx,
@@ -60,15 +81,6 @@ SECP256K1_API int secp256k1_recover_data_serialize(
     unsigned char* out,
     size_t out_size,
     size_t* written
-);
-
-SECP256K1_API int secp256k1_recover_data_deserialize(
-    const secp256k1_context* ctx,
-    const unsigned char* in,
-    size_t in_size,
-    secp256k1_batch_entry* out_entries,
-    size_t out_entries_capacity,
-    size_t* out_n
 );
 
 #ifdef __cplusplus

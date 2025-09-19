@@ -210,6 +210,17 @@ musig_example_LDFLAGS += -lbcrypt
 endif
 TESTS += musig_example
 endif
+if USE_EXAMPLES
+noinst_PROGRAMS += batch_verify_flow
+batch_verify_flow_SOURCES = examples/batch_verify_flow.c
+batch_verify_flow_CPPFLAGS = -I$(top_srcdir)/include -DSECP256K1_STATIC
+batch_verify_flow_LDADD = libsecp256k1.la
+batch_verify_flow_LDFLAGS = -static
+if BUILD_WINDOWS
+batch_verify_flow_LDFLAGS += -lbcrypt
+endif
+TESTS += batch_verify_flow
+endif
 endif
 
 ### Precomputed tables
