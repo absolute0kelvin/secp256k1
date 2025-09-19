@@ -40,6 +40,7 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+#include <stdint.h>
 
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
@@ -1284,6 +1285,179 @@ int verify_sig_one_by_one(const test_data_t *data) {
     }
     
     return all_valid;
+}
+
+/**
+ * lookup_ecrecover - Check the i-th entry matches (r,s,v,z) and return Q if so
+ * 
+ * This function compares the provided 32-byte big-endian r, s, z and 1-byte v
+ * against the i-th entry in recover_data_t. If all match, it returns a pointer
+ * to the corresponding recovered public key Q_i. Otherwise, returns NULL.
+ *
+ * Notes:
+ * - r, s, z are parsed with secp256k1_scalar_set_b32 (mod n). This must match
+ *   how values were stored in recover_data_t.
+ * - If recover_data_t->recovery_flags is present, v is compared to that value;
+ *   otherwise v is computed on-the-fly as parity(R_i.y).
+ * - If verify_in_batch has already been called on this recover_data_t, the
+ *   r_values and s_values may have been overwritten with combined terms and
+ *   will no longer match the original r, s.
+ */
+const secp256k1_ge* lookup_ecrecover(
+    const recover_data_t* rd,
+    size_t i,
+    const unsigned char r_be32[32],
+    const unsigned char s_be32[32],
+    unsigned char v,
+    const unsigned char z_be32[32]
+) {
+    if (!rd || i >= rd->num_entries || !r_be32 || !s_be32 || !z_be32) {
+        return NULL;
+    }
+
+    int overflow = 0;
+    secp256k1_scalar r_in, s_in, z_in;
+    secp256k1_scalar_set_b32(&r_in, r_be32, &overflow);
+    if (overflow || secp256k1_scalar_is_zero(&r_in)) return NULL;
+    secp256k1_scalar_set_b32(&s_in, s_be32, &overflow);
+    if (overflow || secp256k1_scalar_is_zero(&s_in)) return NULL;
+    secp256k1_scalar_set_b32(&z_in, z_be32, &overflow);
+    if (overflow) return NULL;
+
+    unsigned char v_i;
+    if (rd->recovery_flags) {
+        v_i = rd->recovery_flags[i];
+    } else {
+        v_i = (unsigned char)(secp256k1_fe_is_odd(&rd->r_points[i].y) ? 1 : 0);
+    }
+    if (v_i != v) return NULL;
+
+    if (!secp256k1_scalar_eq(&r_in, &rd->r_values[i])) return NULL;
+    if (!secp256k1_scalar_eq(&s_in, &rd->s_values[i])) return NULL;
+    if (!secp256k1_scalar_eq(&z_in, &rd->z_values[i])) return NULL;
+
+    return &rd->recovered_pubkeys[i];
+}
+
+/* ===== Serialization for recover_data_t ===== */
+
+/* Binary format (big-endian header):
+ *   magic:   'R''D''A''T' (4 bytes)
+ *   version: 0x00000001   (4 bytes)
+ *   count:   num_entries  (8 bytes, BE)
+ *   repeated num_entries times:
+ *     Q_i (uncompressed 65 bytes)
+ *     R_i (uncompressed 65 bytes)
+ *     r_i (scalar, 32-byte BE)
+ *     s_i (scalar, 32-byte BE)
+ *     z_i (scalar, 32-byte BE)
+ *     v_i (1 byte: 0 even, 1 odd)
+ */
+
+static void write_u32_be(unsigned char *out, uint32_t v) {
+    out[0] = (unsigned char)((v >> 24) & 0xFF);
+    out[1] = (unsigned char)((v >> 16) & 0xFF);
+    out[2] = (unsigned char)((v >> 8) & 0xFF);
+    out[3] = (unsigned char)(v & 0xFF);
+}
+
+static void write_u64_be(unsigned char *out, uint64_t v) {
+    out[0] = (unsigned char)((v >> 56) & 0xFF);
+    out[1] = (unsigned char)((v >> 48) & 0xFF);
+    out[2] = (unsigned char)((v >> 40) & 0xFF);
+    out[3] = (unsigned char)((v >> 32) & 0xFF);
+    out[4] = (unsigned char)((v >> 24) & 0xFF);
+    out[5] = (unsigned char)((v >> 16) & 0xFF);
+    out[6] = (unsigned char)((v >> 8) & 0xFF);
+    out[7] = (unsigned char)(v & 0xFF);
+}
+
+static uint32_t read_u32_be(const unsigned char *in) {
+    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | (uint32_t)in[3];
+}
+
+static uint64_t read_u64_be(const unsigned char *in) {
+    return ((uint64_t)in[0] << 56) | ((uint64_t)in[1] << 48) | ((uint64_t)in[2] << 40) |
+           ((uint64_t)in[3] << 32) | ((uint64_t)in[4] << 24) | ((uint64_t)in[5] << 16) |
+           ((uint64_t)in[6] << 8) | (uint64_t)in[7];
+}
+
+size_t recover_data_serialized_size(const recover_data_t *rd) {
+    if (!rd) return 0;
+    /* header (16) + entries * 227 (65+65+32+32+32+1) */
+    return (size_t)16 + rd->num_entries * (size_t)227;
+}
+
+int recover_data_serialize(const recover_data_t *rd, unsigned char *out, size_t out_size, size_t *written) {
+    if (!rd || !out || out_size < recover_data_serialized_size(rd)) return 0;
+    size_t offset = 0;
+    /* header */
+    out[offset++] = 'R'; out[offset++] = 'D'; out[offset++] = 'A'; out[offset++] = 'T';
+    write_u32_be(&out[offset], 1); offset += 4;
+    write_u64_be(&out[offset], (uint64_t)rd->num_entries); offset += 8;
+    
+    /* entries */
+    for (size_t i = 0; i < rd->num_entries; i++) {
+        /* Q_i uncompressed (65 bytes) */
+        unsigned char q65[65]; size_t qlen = 65; secp256k1_ge qtmp = rd->recovered_pubkeys[i];
+        int okq = secp256k1_eckey_pubkey_serialize(&qtmp, q65, &qlen, 0);
+        if (!okq || qlen != 65) return 0;
+        memcpy(&out[offset], q65, 65); offset += 65;
+        
+        /* R_i uncompressed (65 bytes) */
+        unsigned char r65[65]; size_t rlen = 65; secp256k1_ge rtmp = rd->r_points[i];
+        int okr = secp256k1_eckey_pubkey_serialize(&rtmp, r65, &rlen, 0);
+        if (!okr || rlen != 65) return 0;
+        memcpy(&out[offset], r65, 65); offset += 65;
+        
+        /* r_i, s_i, z_i as 32-byte BE */
+        unsigned char buf32[32];
+        secp256k1_scalar_get_b32(buf32, &rd->r_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
+        secp256k1_scalar_get_b32(buf32, &rd->s_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
+        secp256k1_scalar_get_b32(buf32, &rd->z_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
+        
+        /* v_i */
+        unsigned char vi = rd->recovery_flags ? rd->recovery_flags[i]
+                            : (unsigned char)(secp256k1_fe_is_odd(&rd->r_points[i].y) ? 1 : 0);
+        out[offset++] = (unsigned char)(vi ? 1 : 0);
+    }
+    if (written) *written = offset;
+    return 1;
+}
+
+recover_data_t* recover_data_deserialize(const unsigned char *in, size_t in_size) {
+    if (!in || in_size < 16) return NULL;
+    if (in[0] != 'R' || in[1] != 'D' || in[2] != 'A' || in[3] != 'T') return NULL;
+    uint32_t version = read_u32_be(&in[4]);
+    if (version != 1) return NULL;
+    uint64_t count64 = read_u64_be(&in[8]);
+    if (count64 > SIZE_MAX) return NULL;
+    size_t count = (size_t)count64;
+    size_t expected = (size_t)16 + count * (size_t)227;
+    if (in_size < expected) return NULL;
+
+    recover_data_t *rd = allocate_recover_data(count);
+    if (!rd) return NULL;
+
+    size_t offset = 16;
+    for (size_t i = 0; i < count; i++) {
+        /* Q_i (65 bytes) */
+        if (!secp256k1_eckey_pubkey_parse(&rd->recovered_pubkeys[i], &in[offset], 65)) { free_recover_data(rd); return NULL; }
+        offset += 65;
+        /* R_i (65 bytes) */
+        if (!secp256k1_eckey_pubkey_parse(&rd->r_points[i], &in[offset], 65)) { free_recover_data(rd); return NULL; }
+        offset += 65;
+        /* r_i, s_i, z_i */
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&rd->r_values[i], &in[offset], &overflow); offset += 32;
+        if (secp256k1_scalar_is_zero(&rd->r_values[i])) { free_recover_data(rd); return NULL; }
+        secp256k1_scalar_set_b32(&rd->s_values[i], &in[offset], &overflow); offset += 32;
+        if (secp256k1_scalar_is_zero(&rd->s_values[i])) { free_recover_data(rd); return NULL; }
+        secp256k1_scalar_set_b32(&rd->z_values[i], &in[offset], &overflow); offset += 32;
+        /* v_i */
+        rd->recovery_flags[i] = (unsigned char)(in[offset++] ? 1 : 0);
+    }
+    return rd;
 }
 
 /**

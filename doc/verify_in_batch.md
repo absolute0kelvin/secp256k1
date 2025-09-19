@@ -84,21 +84,23 @@ For performance, the implementation overwrites `r_values[i]` and `s_values[i]` w
 - If the sum equals the point at infinity, then with overwhelming probability each tuple satisfies `z_i·G + r_i·Q_i − s_i·R_i = 0`.
 
 4) Serve ecrecover queries
-- For an ecrecover request `(r, s, v, z)`:
-  - Look up an entry with matching `(r_i == r, s_i == s, v_i == v, z_i == z)`.
-  - If found (and the batch verification above has succeeded), return the corresponding `Q_i`.
-  - If not found, the request does not correspond to any prevalidated tuple; reject it.
+- For an ecrecover request `(r, s, v, z)` at a specific index `i`:
+  - Check the i-th entry only: `(r_i == r, s_i == s, v_i == v, z_i == z)`.
+  - If it matches (and the batch verification above has succeeded), return `Q_i`.
+  - Otherwise, reject the request for index `i`.
 
 Minimal pseudo-API
 ```c
 // After verify_in_batch succeeds:
-// lookup_ecrecover(r, s, v, z) → Q | NULL
+// lookup_ecrecover(i, r, s, v, z) checks only entry i → Q | NULL
+// r, s, z are 32-byte big-endian values
 const secp256k1_ge* lookup_ecrecover(
     const recover_data_t* rd,
-    const secp256k1_scalar* r,
-    const secp256k1_scalar* s,
+    size_t i,
+    const unsigned char r_be32[32],
+    const unsigned char s_be32[32],
     unsigned char v,
-    const secp256k1_scalar* z
+    const unsigned char z_be32[32]
 );
 ```
 
