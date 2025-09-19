@@ -7,6 +7,9 @@ AM_CFLAGS = $(SECP_CFLAGS)
 lib_LTLIBRARIES = libsecp256k1.la
 include_HEADERS = include/secp256k1.h
 include_HEADERS += include/secp256k1_preallocated.h
+if ENABLE_MODULE_BATCHVERIFY
+include_HEADERS += include/secp256k1_batchverify.h
+endif
 noinst_HEADERS =
 noinst_HEADERS += src/scalar.h
 noinst_HEADERS += src/scalar_4x64.h
@@ -310,4 +313,8 @@ endif
 
 if ENABLE_MODULE_ELLSWIFT
 include src/modules/ellswift/Makefile.am.include
+endif
+
+if ENABLE_MODULE_BATCHVERIFY
+noinst_HEADERS += src/modules/batchverify/main_impl.h
 endif
