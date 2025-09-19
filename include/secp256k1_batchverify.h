@@ -59,7 +59,6 @@ SECP256K1_API int secp256k1_verify_in_batch(
 
 /* Lookup the i-th entry by (r,s,v,z); writes Q65 on success, returns 1/0. */
 SECP256K1_API int secp256k1_lookup_ecrecover_i(
-    const secp256k1_context* ctx,
     const secp256k1_batch_entry* entries,
     size_t n,
     size_t i,

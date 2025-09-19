@@ -88,7 +88,6 @@ _Static_assert(sizeof(secp256k1_batch_entry) == 227, "secp256k1_batch_entry must
 #include "../../scratch_impl.h"
 
 SECP256K1_API int secp256k1_lookup_ecrecover_i(
-    const secp256k1_context* ctx,
     const secp256k1_batch_entry* entries,
     size_t n,
     size_t i,
@@ -100,7 +99,6 @@ SECP256K1_API int secp256k1_lookup_ecrecover_i(
 ) {
     int overflow = 0;
     secp256k1_scalar r_in, s_in, z_in, r_ref, s_ref, z_ref;
-    (void)ctx;
     if (!entries || !Q65_out || !r32 || !s32 || !z32 || i >= n) return 0;
 
     secp256k1_scalar_set_b32(&r_in, r32, &overflow); if (overflow || secp256k1_scalar_is_zero(&r_in)) return 0;

@@ -357,7 +357,7 @@ static int run_load(const secp256k1_context* ctx, const char* load_path) {
     {
         unsigned char Q65_out[65];
         int match = secp256k1_lookup_ecrecover_i(
-            ctx, entries_view, n2, 0,
+            entries_view, n2, 0,
             entries_view[0].r32, entries_view[0].s32, entries_view[0].v, entries_view[0].z32,
             Q65_out
         );
