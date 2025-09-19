@@ -65,3 +65,46 @@ For performance, the implementation overwrites `r_values[i]` and `s_values[i]` w
 - Scope: Consistency-only. External identity binding, if needed, must be layered on top by the caller.
 
 
+## End-to-end workflow (untrusted tuples → ecrecover)
+
+1) Receive untrusted precomputed tuples
+- Inputs per entry i: `(r_i, s_i, z_i, Q_i, R_i)`.
+- Goal: validate these tuples for internal ECDSA consistency and make them queryable via `(r, s, v, z)`.
+
+2) Compute v and enforce invariants
+- Compute `v_i := parity(R_i.y)` and store it (we expose this as `recovery_flags[i]`).
+- Run `sanity_check` on all entries to ensure:
+  - `Q_i`, `R_i` are on-curve and not infinity.
+  - `r_i != 0`, `s_i` is low (`s_i < n/2`).
+  - Binding `r_i == x(R_i) mod n`.
+
+3) Batch-check consistency of Q and R with r, s, z
+- Run `verify_in_batch` with random coefficients `a_i` to check
+  `(Σ a_i·z_i)·G + Σ (a_i·r_i)·Q_i + Σ (a_i·(-s_i))·R_i = 0`.
+- If the sum equals the point at infinity, then with overwhelming probability each tuple satisfies `z_i·G + r_i·Q_i − s_i·R_i = 0`.
+
+4) Serve ecrecover queries
+- For an ecrecover request `(r, s, v, z)`:
+  - Look up an entry with matching `(r_i == r, s_i == s, v_i == v, z_i == z)`.
+  - If found (and the batch verification above has succeeded), return the corresponding `Q_i`.
+  - If not found, the request does not correspond to any prevalidated tuple; reject it.
+
+Minimal pseudo-API
+```c
+// After verify_in_batch succeeds:
+// lookup_ecrecover(r, s, v, z) → Q | NULL
+const secp256k1_ge* lookup_ecrecover(
+    const recover_data_t* rd,
+    const secp256k1_scalar* r,
+    const secp256k1_scalar* s,
+    unsigned char v,
+    const secp256k1_scalar* z
+);
+```
+
+Operational notes
+- Use a fresh, unpredictable multiplier per batch to derive `a_i`.
+- Store `(r, s, v, z) → index` for O(1) lookups, or scan linearly if the set is small.
+- If identity binding is required, additionally check the looked-up `Q` against your trusted directory of keys.
+
+
