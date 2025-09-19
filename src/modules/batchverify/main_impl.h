@@ -47,6 +47,7 @@
  * - Q and R are on-curve and not infinity
  * - r != 0, s is canonical (low-S), z is parsed into scalar
  * - r == x(R) mod n (re-binding check, independent of serialized r32)
+ * - v matches parity(R.y)
  *
  * MSM equation and security
  * -------------------------
@@ -296,6 +297,15 @@ SECP256K1_API int secp256k1_verify_in_batch(
         if (!secp256k1_eckey_pubkey_parse(&R[i], entries[i].R65, 65)) { overflow = 1; break; }
         if (!secp256k1_ge_is_valid_var(&Q[i]) || secp256k1_ge_is_infinity(&Q[i])) { overflow = 1; break; }
         if (!secp256k1_ge_is_valid_var(&R[i]) || secp256k1_ge_is_infinity(&R[i])) { overflow = 1; break; }
+        {
+            unsigned char yb[32];
+            int y_is_odd;
+            secp256k1_fe y = R[i].y;
+            secp256k1_fe_normalize_var(&y);
+            secp256k1_fe_get_b32(yb, &y);
+            y_is_odd = (yb[31] & 1);
+            if ((entries[i].v ? 1 : 0) != y_is_odd) { overflow = 1; break; }
+        }
         secp256k1_scalar_set_b32(&r[i], entries[i].r32, &overflow); if (overflow || secp256k1_scalar_is_zero(&r[i])) { overflow = 1; break; }
         secp256k1_scalar_set_b32(&s[i], entries[i].s32, &overflow); if (overflow || secp256k1_scalar_is_zero(&s[i]) || secp256k1_scalar_is_high(&s[i])) { overflow = 1; break; }
         secp256k1_scalar_set_b32(&z[i], entries[i].z32, &overflow); if (overflow) { overflow = 1; break; }
