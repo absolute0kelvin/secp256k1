@@ -35,7 +35,7 @@ SECP256K1_API int secp256k1_verify_in_batch_rdat(
     const secp256k1_context* ctx,
     const unsigned char* in,
     size_t in_size,
-    const unsigned char multiplier32[32]
+    const unsigned char* multiplier32
 );
 
 /* Parse RDAT v1 and return a zero-copy view of entries. Validates magic,
@@ -54,7 +54,7 @@ SECP256K1_API int secp256k1_verify_in_batch(
     const secp256k1_context* ctx,
     const secp256k1_batch_entry* entries,
     size_t n,
-    const unsigned char multiplier32[32]
+    const unsigned char* multiplier32
 );
 
 /* Lookup the i-th entry by (r,s,v,z); writes Q65 on success, returns 1/0. */

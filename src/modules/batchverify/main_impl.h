@@ -118,7 +118,10 @@ SECP256K1_API int secp256k1_lookup_ecrecover_i(
 }
 
 SECP256K1_API size_t secp256k1_recover_data_serialized_size(size_t n) {
-    return (size_t)16 + n * (size_t)227;
+    size_t base = (size_t)16 + n * (size_t)227;
+    /* Round up to 8-byte boundary to allow optional end padding. */
+    size_t padded = (base + (size_t)7) & ~((size_t)7);
+    return padded;
 }
 
 SECP256K1_API int secp256k1_recover_data_serialize(
@@ -129,6 +132,7 @@ SECP256K1_API int secp256k1_recover_data_serialize(
     size_t out_size,
     size_t* written
 ) {
+    size_t base_need;
     size_t need;
     size_t offset;
     size_t i;
@@ -141,6 +145,7 @@ SECP256K1_API int secp256k1_recover_data_serialize(
     int of2 = 0;
     (void)ctx;
     if (!entries || !out) return 0;
+    base_need = (size_t)16 + n * (size_t)227;
     need = secp256k1_recover_data_serialized_size(n);
     if (out_size < need) return 0;
     offset = 0;
@@ -171,11 +176,14 @@ SECP256K1_API int secp256k1_recover_data_serialize(
         memcpy(&out[offset], entries[i].z32, 32); offset += 32;
         out[offset++] = (unsigned char)(entries[i].v ? 1 : 0);
     }
+    /* Add trailing zero padding to reach 8-byte boundary (optional; ignored by reader). */
+    while ((offset & (size_t)7) != 0) {
+        out[offset++] = 0x00;
+    }
+    if (offset < base_need) return 0; /* should never happen */
     if (written) *written = offset;
     return 1;
 }
-
-/* removed secp256k1_recover_data_deserialize: zero-copy RDAT path supersedes it */
 
 /* Parse RDAT v1 and return a zero-copy view of entries */
 SECP256K1_API int secp256k1_rdat_view_parse(
@@ -203,7 +211,7 @@ SECP256K1_API int secp256k1_verify_in_batch_rdat(
     const secp256k1_context* ctx,
     const unsigned char* in,
     size_t in_size,
-    const unsigned char multiplier32[32]
+    const unsigned char* multiplier32
 ) {
     size_t n;
     size_t need;
@@ -248,7 +256,7 @@ SECP256K1_API int secp256k1_verify_in_batch(
     const secp256k1_context* ctx,
     const secp256k1_batch_entry* entries,
     size_t n,
-    const unsigned char multiplier32[32]
+    const unsigned char* multiplier32
 ) {
     int overflow = 0;
     secp256k1_scalar multiplier;
