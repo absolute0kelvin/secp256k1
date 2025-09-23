@@ -55,6 +55,7 @@
 #include "src/scratch_impl.h"
 #include "src/ecdsa_impl.h"
 #include "src/hash_impl.h"
+#include "src/eckey_impl.h"
 
 /* Ensure STRAUSS_SCRATCH_OBJECTS is defined - should be 5 from ecmult_impl.h */
 #ifndef STRAUSS_SCRATCH_OBJECTS
@@ -549,6 +550,11 @@ recover_data_t* recover_components(const test_data_t *test_data) {
             continue;
         }
         
+        /* Fill recovery flag from parity of R.y (0 for even, 1 for odd) */
+        if (recover_data->recovery_flags) {
+            recover_data->recovery_flags[i] = (unsigned char)(secp256k1_fe_is_odd(&recover_data->r_points[i].y) ? 1 : 0);
+        }
+        
         /* 
          * Step 5: Extract r value (x-coordinate) as scalar for verification efficiency
          * 
@@ -766,9 +772,14 @@ int sanity_check(const recover_data_t *data) {
             break;
         }
 
-        /* Fill recovery_flags[i] according to parity of recovered_pubkeys[i].y */
+        /* Check recovery_flags[i] matches parity of R.y */
         if (data->recovery_flags) {
-            data->recovery_flags[i] = (unsigned char)(secp256k1_fe_is_odd(&data->recovered_pubkeys[i].y) ? 1 : 0);
+            unsigned char expected = (unsigned char)(secp256k1_fe_is_odd(&data->r_points[i].y) ? 1 : 0);
+            if (data->recovery_flags[i] != expected) {
+                printf("sanity_check: recovery_flags[%zu]=%u does not match R.y parity (%u)\n", i, data->recovery_flags[i], expected);
+                all_valid = 0;
+                break;
+            }
         }
         
         /* Check 3: Validate z values (0 <= z < n) */
@@ -1001,197 +1012,6 @@ int verify_one_by_one(const test_data_t *test_data, const recover_data_t *recove
 }
 
 /**
- * verify_in_batch - Batch verify signatures using random linear combination
- * 
- * Usage model:
- * - Inputs r_i, s_i, z_i, Q_i, R_i are provided by an untrusted party.
- * - We compute v_i (recovery id) from R_i as v_i := parity(R_i.y) (0 for even, 1 for odd).
- * - We then batch-check consistency: (Σ z_i·a_i)·G + Σ (r_i·a_i)·Q_i + Σ ((-s_i)·a_i)·R_i = 0.
- *   If this holds, with overwhelming probability each tuple satisfies z_i·G + r_i·Q_i - s_i·R_i = 0.
- * - Later, when an ecrecover computation is requested, we match its (r, s, v, z)
- *   against the precomputed set and return the corresponding Q if found.
- * 
- * This function implements the batch equation:
- *   (Σ z_i * a_i) * G + Σ (r_i * a_i * Q_i) + Σ ((-s_i) * a_i * R_i) = 0
- * where a_i are per-entry random coefficients derived from `multiplier`.
- * 
- * Security notes:
- * - `sanity_check` is called first to enforce on-curve constraints, low-s, r != 0,
- *   and the binding r_i == x(R_i) mod n. The batch equation then ensures global
- *   consistency of Q and R with r, s, z.
- * - For secp256k1, the recovery id has only parity (bit 0); the overflow bit (bit 1)
- *   is always 0 for valid signatures produced by the library. If you need Ethereum-style
- *   v in {27,28}, map as v_eth = 27 + v_i.
- * 
- * @param recover_data Recovered cryptographic components to verify (and to store v_i)
- * @param multiplier Random scalar multiplier for generating random coefficients a_i
- * @return 1 if batch verification succeeds, 0 if it fails
- */
-
-/**
- * batch_ecmult_callback - Callback function for batch signature verification
- * 
- * This callback provides scalar coefficients and points for multi-scalar
- * multiplication during batch ECDSA signature verification. It implements
- * the batch verification equation by providing combined terms:
- * 
- * Term Layout:
- * - Terms 0 to (num_entries-1): (r_i * a_i) * Q_i 
- * - Terms num_entries to (2*num_entries-1): (-s_i * a_i) * R_i
- * 
- * The function expects that r_values and s_values arrays have been pre-computed
- * to contain the combined values (r_i * a_i) and (-s_i * a_i) respectively,
- * where a_i are the random coefficients for batch verification.
- * 
- * Mathematical Context:
- * This supports the batch verification equation:
- * (Σ z_i * a_i) * G + Σ (r_i * a_i * Q_i) + Σ ((-s_i) * a_i * R_i) = 0
- * 
- * @param sc Output scalar coefficient for the current term
- * @param pt Output point for the current term  
- * @param idx Term index (0 to 2*num_entries-1)
- * @param data Pointer to recover_data_t structure with pre-computed combined values
- * @return 1 on success, 0 on invalid index
- */
-static int batch_ecmult_callback(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
-    const recover_data_t *recover_data = (const recover_data_t *)data;
-    
-    if (idx < recover_data->num_entries) {
-        /* First num_entries terms: (r_i * a_i) * Q_i */
-        *sc = recover_data->r_values[idx];
-        *pt = recover_data->recovered_pubkeys[idx];
-        return 1;
-    } else if (idx < 2 * recover_data->num_entries) {
-        /* Next num_entries terms: (-s_i * a_i) * R_i */
-        size_t r_idx = idx - recover_data->num_entries;
-        *sc = recover_data->s_values[r_idx];
-        *pt = recover_data->r_points[r_idx];
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
-int verify_in_batch(const recover_data_t *recover_data, const secp256k1_scalar *multiplier) {
-    if(!sanity_check(recover_data)) {
-        printf("verify_in_batch: Invalid input data\n");
-        return 0;
-    }
-
-    if (!recover_data || recover_data->num_entries == 0) {
-        printf("verify_in_batch: Invalid input data\n");
-        return 0;
-    }
-    
-    printf("Performing batch verification of %zu signatures...\n", recover_data->num_entries);
-    
-    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
-    if (!ctx) {
-        printf("verify_in_batch: Failed to create secp256k1 context\n");
-        return 0;
-    }
-    
-    /* Calculate scratch size - secp256k1_ecmult_multi_var uses Pippenger if terms >= ECMULT_PIPPENGER_THRESHOLD, else Strauss */
-    size_t num_terms = 2 * recover_data->num_entries; /* 2n terms: n Q terms + n R terms */
-    size_t scratch_size;
-    /* use num_terms*2 because we want to use more memory for the Pippenger algorithm */
-    if (num_terms >= ECMULT_PIPPENGER_THRESHOLD) {
-        /* Use optimal bucket window for Pippenger algorithm */
-        int bucket_window = secp256k1_pippenger_bucket_window(num_terms);
-        scratch_size = secp256k1_pippenger_scratch_size(num_terms*2, bucket_window);
-    } else {
-        scratch_size = secp256k1_strauss_scratch_size(num_terms) + STRAUSS_SCRATCH_OBJECTS*16;
-    }
-
-    secp256k1_scratch *scratch = secp256k1_scratch_create(secp256k1_default_error_callback_fn, scratch_size);
-    if (!scratch) {
-        printf("verify_in_batch: Failed to create scratch space\n");
-        secp256k1_context_destroy(ctx);
-        return 0;
-    }
-    
-    /* Compute v_i (recovery id parity) from R_i.y and store in recovery_flags if available */
-    if (((recover_data_t*)recover_data)->recovery_flags) {
-        for (size_t i = 0; i < recover_data->num_entries; i++) {
-            ((recover_data_t*)recover_data)->recovery_flags[i] = (unsigned char)(secp256k1_fe_is_odd(&recover_data->r_points[i].y) ? 1 : 0);
-        }
-    }
-
-    /* Generate pseudo-random coefficients a_i using simple LCG */
-    unsigned char seed[32] = {0x42}; /* Simple deterministic seed */
-    secp256k1_scalar seed_scalar;
-    int overflow;
-    secp256k1_scalar_set_b32(&seed_scalar, seed, &overflow);
-    
-    /* Extract r values from R points and compute combined scalars */
-    secp256k1_scalar combined_z;
-    secp256k1_scalar_set_int(&combined_z, 0); /* Initialize to zero */
-    
-    /* Start with seed * multiplier for a_0 */
-    secp256k1_scalar current_a = seed_scalar;
-    secp256k1_scalar_mul(&current_a, &current_a, multiplier);
-    
-    for (size_t i = 0; i < recover_data->num_entries; i++) {
-        /* Compute combined scalars: z_i * a_i, r_i * a_i, (-s_i) * a_i */
-        /* Note: r values are pre-computed in recover_data->r_values during recovery */
-        secp256k1_scalar temp_z_a;
-        
-        /* z_i * a_i and add to combined_z */
-        secp256k1_scalar_mul(&temp_z_a, &recover_data->z_values[i], &current_a);
-        secp256k1_scalar_add(&combined_z, &combined_z, &temp_z_a);
-        
-        /* r_i * a_i - store directly back in r_values array */
-        secp256k1_scalar temp_r;
-        temp_r = recover_data->r_values[i]; /* Save original */
-        secp256k1_scalar_mul(&((recover_data_t*)recover_data)->r_values[i], &temp_r, &current_a);
-        
-        /* (-s_i) * a_i - store directly back in s_values array */
-        secp256k1_scalar temp_s;
-        temp_s = recover_data->s_values[i]; /* Save original */
-        secp256k1_scalar_negate(&temp_s, &temp_s);
-        secp256k1_scalar_mul(&((recover_data_t*)recover_data)->s_values[i], &temp_s, &current_a);
-        
-        /* Update current_a for next iteration: a_{i+1} = a_i * multiplier */
-        if (i + 1 < recover_data->num_entries) {
-            secp256k1_scalar_mul(&current_a, &current_a, multiplier);
-        }
-    }
-    
-    /* Compute batch verification: (Σ z_i * a_i) * G + Σ terms */
-    /* Pass recover_data directly to callback - it now contains the workspace arrays */
-    secp256k1_gej result_gej;
-    int ret = secp256k1_ecmult_multi_var(secp256k1_default_error_callback_fn, scratch, &result_gej,
-                                       &combined_z, batch_ecmult_callback, (void*)recover_data, num_terms);
-    
-    int verification_result = 0;
-    if (!ret) {
-        printf("verify_in_batch: Multi-scalar multiplication failed\n");
-    } else {
-        /* Check if result is point at infinity (representing zero) */
-        if (secp256k1_gej_is_infinity(&result_gej)) {
-            printf("Batch verification succeeded! All %zu signatures are valid.\n", recover_data->num_entries);
-            verification_result = 1;
-        } else {
-            printf("Batch verification failed! Result is not infinity.\n");
-            verification_result = 0;
-        }
-    }
-    
-cleanup:
-    /* Clear sensitive data */
-    /* Note: r_values and s_values now contain combined values from batch verification */
-    /* They will be cleared when the recover_data structure is freed */
-    secp256k1_scalar_clear(&combined_z);
-    secp256k1_scalar_clear(&seed_scalar);
-    secp256k1_scalar_clear(&current_a);
-    
-    secp256k1_scratch_destroy(secp256k1_default_error_callback_fn, scratch);
-    secp256k1_context_destroy(ctx);
-    
-    return verification_result;
-}
-
-/**
  * verify_sig_one_by_one - Verify all signatures in test data using standard ECDSA verification
  * 
  * This function provides an independent validation method for all signatures in the
@@ -1337,198 +1157,6 @@ const secp256k1_ge* lookup_ecrecover(
     if (!secp256k1_scalar_eq(&z_in, &rd->z_values[i])) return NULL;
 
     return &rd->recovered_pubkeys[i];
-}
-
-/* ===== Serialization for recover_data_t ===== */
-
-/* Binary format (big-endian header):
- *   magic:   'R''D''A''T' (4 bytes)
- *   version: 0x00000001   (4 bytes)
- *   count:   num_entries  (8 bytes, BE)
- *   repeated num_entries times:
- *     Q_i (uncompressed 65 bytes)
- *     R_i (uncompressed 65 bytes)
- *     r_i (scalar, 32-byte BE)
- *     s_i (scalar, 32-byte BE)
- *     z_i (scalar, 32-byte BE)
- *     v_i (1 byte: 0 even, 1 odd)
- */
-
-static void write_u32_be(unsigned char *out, uint32_t v) {
-    out[0] = (unsigned char)((v >> 24) & 0xFF);
-    out[1] = (unsigned char)((v >> 16) & 0xFF);
-    out[2] = (unsigned char)((v >> 8) & 0xFF);
-    out[3] = (unsigned char)(v & 0xFF);
-}
-
-static void write_u64_be(unsigned char *out, uint64_t v) {
-    out[0] = (unsigned char)((v >> 56) & 0xFF);
-    out[1] = (unsigned char)((v >> 48) & 0xFF);
-    out[2] = (unsigned char)((v >> 40) & 0xFF);
-    out[3] = (unsigned char)((v >> 32) & 0xFF);
-    out[4] = (unsigned char)((v >> 24) & 0xFF);
-    out[5] = (unsigned char)((v >> 16) & 0xFF);
-    out[6] = (unsigned char)((v >> 8) & 0xFF);
-    out[7] = (unsigned char)(v & 0xFF);
-}
-
-static uint32_t read_u32_be(const unsigned char *in) {
-    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | (uint32_t)in[3];
-}
-
-static uint64_t read_u64_be(const unsigned char *in) {
-    return ((uint64_t)in[0] << 56) | ((uint64_t)in[1] << 48) | ((uint64_t)in[2] << 40) |
-           ((uint64_t)in[3] << 32) | ((uint64_t)in[4] << 24) | ((uint64_t)in[5] << 16) |
-           ((uint64_t)in[6] << 8) | (uint64_t)in[7];
-}
-
-size_t recover_data_serialized_size(const recover_data_t *rd) {
-    if (!rd) return 0;
-    /* header (16) + entries * 227 (65+65+32+32+32+1) */
-    return (size_t)16 + rd->num_entries * (size_t)227;
-}
-
-int recover_data_serialize(const recover_data_t *rd, unsigned char *out, size_t out_size, size_t *written) {
-    if (!rd || !out || out_size < recover_data_serialized_size(rd)) return 0;
-    size_t offset = 0;
-    /* header */
-    out[offset++] = 'R'; out[offset++] = 'D'; out[offset++] = 'A'; out[offset++] = 'T';
-    write_u32_be(&out[offset], 1); offset += 4;
-    write_u64_be(&out[offset], (uint64_t)rd->num_entries); offset += 8;
-    
-    /* entries */
-    for (size_t i = 0; i < rd->num_entries; i++) {
-        /* Q_i uncompressed (65 bytes) */
-        unsigned char q65[65]; size_t qlen = 65; secp256k1_ge qtmp = rd->recovered_pubkeys[i];
-        int okq = secp256k1_eckey_pubkey_serialize(&qtmp, q65, &qlen, 0);
-        if (!okq || qlen != 65) return 0;
-        memcpy(&out[offset], q65, 65); offset += 65;
-        
-        /* R_i uncompressed (65 bytes) */
-        unsigned char r65[65]; size_t rlen = 65; secp256k1_ge rtmp = rd->r_points[i];
-        int okr = secp256k1_eckey_pubkey_serialize(&rtmp, r65, &rlen, 0);
-        if (!okr || rlen != 65) return 0;
-        memcpy(&out[offset], r65, 65); offset += 65;
-        
-        /* r_i, s_i, z_i as 32-byte BE */
-        unsigned char buf32[32];
-        secp256k1_scalar_get_b32(buf32, &rd->r_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
-        secp256k1_scalar_get_b32(buf32, &rd->s_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
-        secp256k1_scalar_get_b32(buf32, &rd->z_values[i]); memcpy(&out[offset], buf32, 32); offset += 32;
-        
-        /* v_i */
-        unsigned char vi = rd->recovery_flags ? rd->recovery_flags[i]
-                            : (unsigned char)(secp256k1_fe_is_odd(&rd->r_points[i].y) ? 1 : 0);
-        out[offset++] = (unsigned char)(vi ? 1 : 0);
-    }
-    if (written) *written = offset;
-    return 1;
-}
-
-recover_data_t* recover_data_deserialize(const unsigned char *in, size_t in_size) {
-    if (!in || in_size < 16) return NULL;
-    if (in[0] != 'R' || in[1] != 'D' || in[2] != 'A' || in[3] != 'T') return NULL;
-    uint32_t version = read_u32_be(&in[4]);
-    if (version != 1) return NULL;
-    uint64_t count64 = read_u64_be(&in[8]);
-    if (count64 > SIZE_MAX) return NULL;
-    size_t count = (size_t)count64;
-    size_t expected = (size_t)16 + count * (size_t)227;
-    if (in_size < expected) return NULL;
-
-    recover_data_t *rd = allocate_recover_data(count);
-    if (!rd) return NULL;
-
-    size_t offset = 16;
-    for (size_t i = 0; i < count; i++) {
-        /* Q_i (65 bytes) */
-        if (!secp256k1_eckey_pubkey_parse(&rd->recovered_pubkeys[i], &in[offset], 65)) { free_recover_data(rd); return NULL; }
-        offset += 65;
-        /* R_i (65 bytes) */
-        if (!secp256k1_eckey_pubkey_parse(&rd->r_points[i], &in[offset], 65)) { free_recover_data(rd); return NULL; }
-        offset += 65;
-        /* r_i, s_i, z_i */
-        int overflow = 0;
-        secp256k1_scalar_set_b32(&rd->r_values[i], &in[offset], &overflow); offset += 32;
-        if (secp256k1_scalar_is_zero(&rd->r_values[i])) { free_recover_data(rd); return NULL; }
-        secp256k1_scalar_set_b32(&rd->s_values[i], &in[offset], &overflow); offset += 32;
-        if (secp256k1_scalar_is_zero(&rd->s_values[i])) { free_recover_data(rd); return NULL; }
-        secp256k1_scalar_set_b32(&rd->z_values[i], &in[offset], &overflow); offset += 32;
-        /* v_i */
-        rd->recovery_flags[i] = (unsigned char)(in[offset++] ? 1 : 0);
-    }
-    return rd;
-}
-
-/**
- * compare_verification_performance - Benchmark and compare all three verification methods
- * 
- * This function measures and compares the runtime performance of:
- * 1. verify_sig_one_by_one - Standard secp256k1_ecdsa_verify for each signature
- * 2. verify_one_by_one - Individual z*G + r*Q - s*R = 0 verification
- * 3. verify_in_batch - Batch verification using random linear combinations
- * 
- * @param test_data Original test data with signatures
- * @param recover_data Recovered cryptographic components
- */
-void compare_verification_performance(const test_data_t *test_data, const recover_data_t *recover_data) {
-    if (!test_data || !recover_data) {
-        printf("compare_verification_performance: Invalid input data\n");
-        return;
-    }
-    
-    printf("\n=== Performance Comparison ===\n");
-    printf("Testing %zu signatures...\n\n", test_data->num_entries);
-    
-    clock_t start, end;
-    double cpu_time_used;
-    
-    /* Test 1: verify_sig_one_by_one */
-    printf("1. Testing verify_sig_one_by_one (standard ECDSA verification)...\n");
-    start = clock();
-    int result1 = verify_sig_one_by_one(test_data);
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("   Result: %s\n", result1 ? "PASS" : "FAIL");
-    printf("   Time: %.6f seconds\n", cpu_time_used);
-    printf("   Time per signature: %.6f ms\n\n", (cpu_time_used * 1000.0) / test_data->num_entries);
-    
-    /* Test 2: verify_one_by_one */
-    printf("2. Testing verify_one_by_one (z*G + r*Q - s*R = 0 formula)...\n");
-    start = clock();
-    int result2 = verify_one_by_one(test_data, recover_data);
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("   Result: %s\n", result2 ? "PASS" : "FAIL");
-    printf("   Time: %.6f seconds\n", cpu_time_used);
-    printf("   Time per signature: %.6f ms\n\n", (cpu_time_used * 1000.0) / test_data->num_entries);
-    
-    /* Test 3: verify_in_batch */
-    printf("3. Testing verify_in_batch (batch verification with random coefficients)...\n");
-    
-    /* Create multiplier for random coefficient generation */
-    secp256k1_scalar multiplier;
-    unsigned char mult_bytes[32] = {
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00
-    };
-    int overflow;
-    secp256k1_scalar_set_b32(&multiplier, mult_bytes, &overflow);
-    
-    start = clock();
-    int result3 = verify_in_batch(recover_data, &multiplier);
-    end = clock();
-    
-    /* Clear multiplier for security */
-    secp256k1_scalar_clear(&multiplier);
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("   Result: %s\n", result3 ? "PASS" : "FAIL");
-    printf("   Time: %.6f seconds\n", cpu_time_used);
-    printf("   Time per signature: %.6f ms\n\n", (cpu_time_used * 1000.0) / test_data->num_entries);
-    
-    printf("=============================\n\n");
 }
 
 /**
@@ -1718,6 +1346,110 @@ void print_test_data_summary(const test_data_t *data) {
     printf("========================\n\n");
 }
 
+#include "verify_in_batch.c"
+
+/* Convert recover_data_t into a newly allocated array of secp256k1_batch_entry.
+ * Caller must free(*entries_out) with free(). Returns 1 on success, 0 on failure. */
+static int recover_data_to_entries(
+    const recover_data_t* rd,
+    secp256k1_batch_entry** entries_out,
+    size_t* n_out
+) {
+    if (!rd || !entries_out || !n_out || rd->num_entries == 0) {
+        return 0;
+    }
+
+    size_t n = rd->num_entries;
+    secp256k1_batch_entry* entries = (secp256k1_batch_entry*)malloc(n * sizeof(*entries));
+    if (!entries) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        size_t len;
+
+        /* Q65: serialize recovered_pubkeys[i] to uncompressed (65 bytes) */
+        len = 65;
+        if (!secp256k1_eckey_pubkey_serialize(&rd->recovered_pubkeys[i], entries[i].Q65, &len, 0)) {
+            free(entries);
+            return 0;
+        }
+        if (len != 65) { free(entries); return 0; }
+
+        /* R65: serialize r_points[i] to uncompressed (65 bytes) */
+        len = 65;
+        if (!secp256k1_eckey_pubkey_serialize(&rd->r_points[i], entries[i].R65, &len, 0)) {
+            free(entries);
+            return 0;
+        }
+        if (len != 65) { free(entries); return 0; }
+
+        /* r32, s32, z32: export scalars to big-endian 32-byte */
+        secp256k1_scalar_get_b32(entries[i].r32, &rd->r_values[i]);
+        secp256k1_scalar_get_b32(entries[i].s32, &rd->s_values[i]);
+        secp256k1_scalar_get_b32(entries[i].z32, &rd->z_values[i]);
+
+        /* v: parity of R.y (or use precomputed recovery_flags if present) */
+        if (rd->recovery_flags) {
+            entries[i].v = rd->recovery_flags[i] ? 1 : 0;
+        } else {
+            entries[i].v = (unsigned char)(secp256k1_fe_is_odd(&rd->r_points[i].y) ? 1 : 0);
+        }
+    }
+
+    *entries_out = entries;
+    *n_out = n;
+    return 1;
+}
+
+/**
+ * compare_verification_performance - Benchmark library batch API path
+ */
+void compare_verification_performance(const recover_data_t *recover_data) {
+    if (!recover_data) {
+        printf("compare_verification_performance: Invalid input data\n");
+        return;
+    }
+
+    /* Prepare entries via converter */
+    secp256k1_batch_entry *entries = NULL;
+    size_t n = 0;
+    if (!recover_data_to_entries(recover_data, &entries, &n)) {
+        printf("compare_verification_performance: Failed to build entries\n");
+        return;
+    }
+
+    /* Create a context required by secp256k1_verify_in_batch */
+    const secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    if (!ctx) {
+        printf("compare_verification_performance: Failed to create context\n");
+        free(entries);
+        return;
+    }
+
+    unsigned char mult_bytes[32] = {
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00
+    };
+
+    printf("\n=== Performance: Library batch API ===\n");
+    clock_t start = clock();
+    int ok = secp256k1_verify_in_batch(ctx, entries, n, mult_bytes);
+    clock_t end = clock();
+    double cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
+
+    printf("   Result: %s\n", ok ? "PASS" : "FAIL");
+    printf("   Time: %.6f seconds\n", cpu_time_used);
+    if (n > 0) {
+        printf("   Time per signature: %.6f ms\n\n", (cpu_time_used * 1000.0) / n);
+    }
+
+    secp256k1_context_destroy((secp256k1_context*)ctx);
+    free(entries);
+}
+
 /**
  * main - Demonstration program for ECDSA signature generation and recovery
  * 
@@ -1791,8 +1523,8 @@ int main(int argc, char *argv[]) {
     /* Print summary of recovered data */
     print_recover_data_summary(recover_data);
     
-    /* Run performance comparison benchmarks */
-    compare_verification_performance(data, recover_data);
+    /* Run performance comparison benchmarks (v2 first to avoid in-place mutation) */
+    compare_verification_performance(recover_data);
     
     /* Clean up recover data */
     free_recover_data(recover_data);
